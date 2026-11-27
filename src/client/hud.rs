@@ -1,6 +1,16 @@
-use std::fmt::Display;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    fmt::Display,
+    fs::File,
+    io::Read,
+    path::Path,
+    sync::OnceLock,
+};
 
 use _8times8::{Amount, Game, Level};
+use ab_glyph::{Font, FontVec, PxScale, point};
+use fontdb::{Database, Family, Query, Weight};
 use winit::dpi::PhysicalSize;
 
 use super::{Painter, Theme};
@@ -11,9 +21,13 @@ pub(super) enum Action {
     Purchase,
     MachineBody(usize),
     MachineUpgrade(usize, usize),
+    #[cfg(debug_assertions)]
     Debug,
+    #[cfg(debug_assertions)]
     DebugCommand(DebugAction),
+    #[cfg(debug_assertions)]
     DebugConfirm,
+    #[cfg(debug_assertions)]
     DebugCancel,
     Sound,
     Theme,
@@ -23,6 +37,7 @@ pub(super) enum Action {
     Block,
 }
 
+#[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DebugAction {
     Reset,
@@ -62,6 +77,7 @@ pub(super) struct MachineRow {
 struct Stock {
     level: Level,
     available: String,
+    #[cfg(debug_assertions)]
     cleared: String,
     reached: bool,
 }
@@ -80,17 +96,24 @@ pub(super) struct Hud {
     manual: Option<Purchase>,
     manual_capacity: String,
     item: bool,
+    #[cfg(debug_assertions)]
     item_on_board: bool,
     tiers: Vec<MachineTier>,
     shop_lines: Vec<ShopLine>,
     shop_height: f64,
     shop_open: bool,
     shop_scroll: f64,
+    #[cfg(debug_assertions)]
     debug_open: bool,
+    #[cfg(debug_assertions)]
     debug_scroll: f64,
+    #[cfg(debug_assertions)]
     debug_pending: Option<DebugAction>,
+    #[cfg(debug_assertions)]
     debug_paused: bool,
+    #[cfg(debug_assertions)]
     debug_speed: u32,
+    #[cfg(debug_assertions)]
     debug_feedback: Option<String>,
     sound: Option<bool>,
     hint: bool,
@@ -106,17 +129,24 @@ impl Default for Hud {
             manual: None,
             manual_capacity: capacity_label(0),
             item: false,
+            #[cfg(debug_assertions)]
             item_on_board: false,
             tiers: Vec::new(),
             shop_lines: Vec::new(),
             shop_height: 0.0,
             shop_open: false,
             shop_scroll: 0.0,
+            #[cfg(debug_assertions)]
             debug_open: false,
+            #[cfg(debug_assertions)]
             debug_scroll: 0.0,
+            #[cfg(debug_assertions)]
             debug_pending: None,
+            #[cfg(debug_assertions)]
             debug_paused: false,
+            #[cfg(debug_assertions)]
             debug_speed: 1,
+            #[cfg(debug_assertions)]
             debug_feedback: None,
             sound: None,
             hint: true,
@@ -141,6 +171,7 @@ impl Hud {
                         || cleared.bits() > 0
                         || game.bonus(level).bits() > 0,
                     available: points_label(available, level),
+                    #[cfg(debug_assertions)]
                     cleared: points_label(cleared, level),
                 }
             })
@@ -160,7 +191,10 @@ impl Hud {
                     }
                 });
         self.item = game.has_drag_item();
-        self.item_on_board = game.item().is_some();
+        #[cfg(debug_assertions)]
+        {
+            self.item_on_board = game.item().is_some();
+        }
         self.rebuild_shop();
     }
 
@@ -196,6 +230,7 @@ impl Hud {
     }
 
     fn tooltip_at(&self, layout: &Layout<'_>, pos: [f64; 2]) -> Option<Action> {
+        #[cfg(debug_assertions)]
         if self.debug_pending.is_some() {
             return None;
         }
@@ -209,16 +244,21 @@ impl Hud {
     }
 
     pub(super) fn toggle_shop(&mut self) {
+        #[cfg(debug_assertions)]
         if self.debug_pending.is_some() {
             return;
         }
         self.shop_open = !self.shop_open;
         if self.shop_open {
             self.shop_scroll = 0.0;
-            self.debug_open = false;
+            #[cfg(debug_assertions)]
+            {
+                self.debug_open = false;
+            }
         }
     }
 
+    #[cfg(debug_assertions)]
     pub(super) fn toggle_debug(&mut self) {
         self.debug_open = !self.debug_open;
         if self.debug_open {
@@ -230,6 +270,7 @@ impl Hud {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub(super) fn set_debug_pending(&mut self, command: Option<DebugAction>) {
         if command.is_some() {
             self.debug_open = true;
@@ -241,11 +282,13 @@ impl Hud {
         self.debug_pending = command;
     }
 
+    #[cfg(debug_assertions)]
     pub(super) fn set_debug_machine_state(&mut self, paused: bool, speed: u32) {
         self.debug_paused = paused;
         self.debug_speed = speed;
     }
 
+    #[cfg(debug_assertions)]
     pub(super) fn set_debug_feedback(&mut self, feedback: Option<String>) {
         self.debug_feedback = feedback;
     }
@@ -256,6 +299,7 @@ impl Hud {
 
     pub(super) fn focused_action(&self) -> Option<Action> {
         let action = self.focus?;
+        #[cfg(debug_assertions)]
         if self.debug_pending.is_some() {
             return matches!(action, Action::DebugConfirm | Action::DebugCancel).then_some(action);
         }
@@ -266,7 +310,9 @@ impl Hud {
                     .enabled_purchases()
                     .any(|(_, row)| row.action == action))
             .then_some(action),
+            #[cfg(debug_assertions)]
             Action::DebugCommand(_) => self.debug_open.then_some(action),
+            #[cfg(debug_assertions)]
             Action::DebugConfirm | Action::DebugCancel => None,
             Action::Sound => self.sound.map(|_| action),
             Action::Block => None,
@@ -282,7 +328,11 @@ impl Hud {
     ) -> Option<Action> {
         let layout = self.layout(size, scale_factor)?;
         let mut items = Vec::new();
-        if self.debug_pending.is_none() {
+        #[cfg(debug_assertions)]
+        let modal_open = self.debug_pending.is_some();
+        #[cfg(not(debug_assertions))]
+        let modal_open = false;
+        if !modal_open {
             items.push((Action::Shop, None));
             if let Some(view) = layout.shop {
                 items.extend(
@@ -291,8 +341,10 @@ impl Hud {
                     }),
                 );
             }
+            #[cfg(debug_assertions)]
             items.push((Action::Debug, None));
         }
+        #[cfg(debug_assertions)]
         if let Some(debug) = &layout.debug {
             items.extend(
                 debug
@@ -300,7 +352,7 @@ impl Hud {
                     .map(|(a, _, rect)| (a, Some((debug.view, rect)))),
             );
         }
-        if self.debug_pending.is_none() {
+        if !modal_open {
             items.extend(layout.controls.iter().map(|&(a, _)| (a, None)));
         }
         if items.is_empty() {
@@ -315,9 +367,11 @@ impl Hud {
         let (action, target) = items[i];
         if let Some((view, rect)) = target {
             let scroll = view.reveal(rect);
+            #[cfg(debug_assertions)]
             if matches!(action, Action::DebugCommand(_)) {
                 self.debug_scroll = scroll;
-            } else if matches!(
+            }
+            if matches!(
                 action,
                 Action::Purchase | Action::MachineBody(_) | Action::MachineUpgrade(_, _)
             ) {
@@ -348,6 +402,7 @@ impl Hud {
             }
             return true;
         }
+        #[cfg(debug_assertions)]
         if let Some(debug) = &layout.debug
             && debug.view.rect.contains(pos)
         {
@@ -371,6 +426,7 @@ impl Hud {
     }
 
     fn hit_layout(&self, layout: &Layout, pos: [f64; 2]) -> Option<Action> {
+        #[cfg(debug_assertions)]
         if let Some(debug) = &layout.debug
             && debug.view.rect.contains(pos)
         {
@@ -383,9 +439,11 @@ impl Hud {
                     .unwrap_or(Action::Block),
             );
         }
+        #[cfg(debug_assertions)]
         if self.debug_pending.is_some() {
             return Some(Action::Block);
         }
+        #[cfg(debug_assertions)]
         if layout.debug_button.contains(pos) {
             return Some(Action::Debug);
         }
@@ -433,19 +491,41 @@ impl Hud {
         let Some(layout) = self.layout(painter.size(), scale_factor) else {
             return;
         };
-        let colors = Palette::for_theme(theme);
         let pointer = cursor.map(|pos| layout.logical(pos));
         let hover = pointer.and_then(|pos| self.hit_layout(&layout, pos));
-        let mut draw = Draw {
-            painter,
-            scale: layout.scale,
-            colors,
-            hover,
-            focus: self.focused_action(),
-        };
+        let start = painter.output.len();
+        let mut raster_scale = layout.scale;
+        loop {
+            let mut draw = Draw {
+                painter,
+                scale: layout.scale,
+                raster_scale,
+                colors: Palette::for_theme(theme),
+                hover,
+                focus: self.focused_action(),
+            };
+            self.paint_layout(&mut draw, &layout, theme, pointer);
+            if painter.output.len() < painter.limit || raster_scale <= 1.0 {
+                break;
+            }
+            // If the board and a dense HUD together fill the buffer, retry just
+            // the HUD at lower bitmap detail rather than dropping later controls.
+            // Hitboxes, pen advances and the painted physical em stay fixed.
+            painter.output.truncate(start);
+            raster_scale = (raster_scale * 0.75).clamp(1.0, 4.0);
+        }
+    }
 
+    fn paint_layout(
+        &self,
+        draw: &mut Draw<'_, '_>,
+        layout: &Layout<'_>,
+        theme: Theme,
+        pointer: Option<[f64; 2]>,
+    ) {
+        let colors = draw.colors;
         if self.hint {
-            paint_hint(&mut draw, &layout);
+            paint_hint(draw, layout);
         }
 
         draw.round(
@@ -489,11 +569,13 @@ impl Hud {
         }
 
         if let Some(view) = layout.shop {
-            self.paint_shop(&mut draw, view);
+            self.paint_shop(draw, view);
         }
+        #[cfg(debug_assertions)]
         if let Some(debug) = &layout.debug {
-            paint_debug(&mut draw, debug, self.debug_feedback.as_deref());
+            paint_debug(draw, debug, self.debug_feedback.as_deref());
         }
+        #[cfg(debug_assertions)]
         draw.label_button(layout.debug_button, DEBUG_TITLE, Action::Debug, true);
 
         for &(action, rect) in &layout.controls {
@@ -501,9 +583,9 @@ impl Hud {
             draw.icon(rect, action, theme, self.sound == Some(true), bg);
         }
         if let (Some(action), Some(pos)) = (self.tooltip, pointer)
-            && self.tooltip_at(&layout, pos) == Some(action)
+            && self.tooltip_at(layout, pos) == Some(action)
         {
-            paint_tooltip(&mut draw, &layout, action, pos);
+            paint_tooltip(draw, layout, action, pos);
         }
     }
 
@@ -601,7 +683,7 @@ impl Hud {
 
         let mut points = Vec::new();
         let (mut px, mut py, mut right) = (24.0, 20.0, 24.0_f64);
-        // Keep balances clear of the top-right debug button in a narrow window.
+        // Keep the status geometry consistent with or without the debug button.
         let point_limit = (w - 97.0).max(80.0);
         for label in self
             .stock
@@ -674,8 +756,12 @@ impl Hud {
             }
         });
 
-        let debug_width = title_width(DEBUG_TITLE);
-        let debug_button = Rect::new(w - 16.0 - debug_width, 14.0, debug_width, 29.0);
+        #[cfg(debug_assertions)]
+        let debug_button = {
+            let width = title_width(DEBUG_TITLE);
+            Rect::new(w - 16.0 - width, 14.0, width, 29.0)
+        };
+        #[cfg(debug_assertions)]
         let debug = (self.debug_open && w >= 240.0 && h >= 175.0).then(|| self.debug_view(w, h));
 
         let actions = [
@@ -713,7 +799,9 @@ impl Hud {
             shop_button,
             save_warning,
             shop,
+            #[cfg(debug_assertions)]
             debug_button,
+            #[cfg(debug_assertions)]
             debug,
             controls,
         })
@@ -723,7 +811,15 @@ impl Hud {
         let colors = draw.colors;
         draw.round(view.rect, 12.0, colors.panel);
         let clip = Some(view.clip);
-        for line in &self.shop_lines {
+        // All lines are ordered by their content y. A row is the tallest;
+        // skip the historic rows before the viewport without rasterizing them.
+        let first = self
+            .shop_lines
+            .partition_point(|line| line.y() + ROW_HEIGHT <= view.scroll);
+        for line in &self.shop_lines[first..] {
+            if line.y() >= view.scroll + view.clip.h {
+                break;
+            }
             match line {
                 ShopLine::Divider(y) => {
                     let y = view.y(*y);
@@ -793,6 +889,7 @@ impl Hud {
         draw_scrollbar(draw, view);
     }
 
+    #[cfg(debug_assertions)]
     fn debug_view(&self, width: f64, height: f64) -> DebugView {
         use DebugAction::*;
         let w = 330.0_f64.min(width - 32.0);
@@ -921,6 +1018,7 @@ fn draw_scrollbar(draw: &mut Draw<'_, '_>, view: ShopView) {
     }
 }
 
+#[cfg(debug_assertions)]
 fn paint_debug(draw: &mut Draw<'_, '_>, debug: &DebugView, feedback: Option<&str>) {
     let colors = draw.colors;
     let view = debug.view;
@@ -1020,6 +1118,7 @@ pub(super) fn capacity_label(exponent: u32) -> String {
 }
 
 const SHOP_TITLE: &str = "強化・機械";
+#[cfg(debug_assertions)]
 const DEBUG_TITLE: &str = "デバッグ";
 const SAVE_WARNING: &str = "自動保存停止中";
 const STATUS_ROW_HEIGHT: f64 = 21.0;
@@ -1038,12 +1137,22 @@ enum ShopLine {
     Row(f64, Purchase),
 }
 
+impl ShopLine {
+    fn y(&self) -> f64 {
+        match self {
+            Self::Divider(y) | Self::Heading(y, _, _) | Self::Meta(y, _) | Self::Row(y, _) => *y,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
 enum DebugPart {
     Divider(f64),
     Label(f64, f64, String, bool),
     Button(Action, Rect, String),
 }
 
+#[cfg(debug_assertions)]
 struct DebugBuilder {
     x: f64,
     y: f64,
@@ -1051,6 +1160,7 @@ struct DebugBuilder {
     parts: Vec<DebugPart>,
 }
 
+#[cfg(debug_assertions)]
 impl DebugBuilder {
     fn new(width: f64) -> Self {
         Self {
@@ -1106,12 +1216,14 @@ impl DebugBuilder {
     }
 }
 
+#[cfg(debug_assertions)]
 struct DebugView {
     view: ShopView,
     parts: Vec<DebugPart>,
     footer: bool,
 }
 
+#[cfg(debug_assertions)]
 impl DebugView {
     fn buttons(&self) -> impl Iterator<Item = (Action, &str, Rect)> {
         self.parts.iter().filter_map(|part| match part {
@@ -1133,7 +1245,9 @@ struct Layout<'a> {
     shop_button: Rect,
     save_warning: Option<Rect>,
     shop: Option<ShopView>,
+    #[cfg(debug_assertions)]
     debug_button: Rect,
+    #[cfg(debug_assertions)]
     debug: Option<DebugView>,
     controls: Vec<(Action, Rect)>,
 }
@@ -1157,6 +1271,7 @@ impl ShopView {
         self.clip.y + content_y - self.scroll
     }
 
+    #[cfg(debug_assertions)]
     fn place(self, content_rect: Rect) -> Rect {
         Rect::new(
             self.clip.x + content_rect.x,
@@ -1240,12 +1355,14 @@ struct Palette {
     ink: Color,
     points_ink: Color,
     title_ink: Color,
+    #[cfg(debug_assertions)]
     debug_ink: Color,
     muted: Color,
     button: Color,
     hover: Color,
     title: Color,
     title_hover: Color,
+    #[cfg(debug_assertions)]
     debug: Color,
     disabled: Color,
     focus: Color,
@@ -1265,12 +1382,14 @@ impl Palette {
                 ink: [106, 106, 103],
                 points_ink: [108, 108, 105],
                 title_ink: [94, 94, 91],
+                #[cfg(debug_assertions)]
                 debug_ink: [163, 163, 161],
                 muted: [110, 111, 105],
                 button: [243, 243, 242],
                 hover: [251, 251, 251],
                 title: [250, 250, 250],
                 title_hover: [254, 254, 254],
+                #[cfg(debug_assertions)]
                 debug: [236, 236, 235],
                 disabled: [242, 242, 240],
                 focus: [111, 117, 116],
@@ -1286,12 +1405,14 @@ impl Palette {
                 ink: [163, 163, 159],
                 points_ink: [193, 193, 189],
                 title_ink: [212, 212, 207],
+                #[cfg(debug_assertions)]
                 debug_ink: [113, 113, 111],
                 muted: [173, 173, 168],
                 button: [54, 54, 56],
                 hover: [67, 67, 69],
                 title: [54, 54, 56],
                 title_hover: [73, 73, 73],
+                #[cfg(debug_assertions)]
                 debug: [48, 48, 50],
                 disabled: [44, 44, 45],
                 focus: [142, 147, 146],
@@ -1306,6 +1427,7 @@ impl Palette {
 struct Draw<'a, 'b> {
     painter: &'a mut Painter<'b>,
     scale: f64,
+    raster_scale: f64,
     colors: Palette,
     hover: Option<Action>,
     focus: Option<Action>,
@@ -1337,6 +1459,7 @@ impl Draw<'_, '_> {
             match (action, hover) {
                 (Action::Shop, false) => self.colors.title,
                 (Action::Shop, true) => self.colors.title_hover,
+                #[cfg(debug_assertions)]
                 (Action::Debug, false) => self.colors.debug,
                 (_, false) => self.colors.button,
                 (_, true) => self.colors.hover,
@@ -1354,13 +1477,19 @@ impl Draw<'_, '_> {
     }
 
     fn label_button(&mut self, rect: Rect, text: &str, action: Action, enabled: bool) {
-        let title = matches!(action, Action::Shop | Action::Debug);
+        let title = match action {
+            Action::Shop => true,
+            #[cfg(debug_assertions)]
+            Action::Debug => true,
+            _ => false,
+        };
         let bg = self.button(rect, action, enabled, if title { 8.0 } else { 7.0 });
         let ink = if !enabled {
             blend(bg, self.colors.ink, 45, 100)
         } else {
             match action {
                 Action::Shop => self.colors.title_ink,
+                #[cfg(debug_assertions)]
                 Action::Debug if self.hover != Some(action) => self.colors.debug_ink,
                 _ => self.colors.ink,
             }
@@ -1406,43 +1535,51 @@ impl Draw<'_, '_> {
         clip: Option<Rect>,
         tracking: f64,
     ) {
-        if clip.is_some_and(|r| y + size + 4.0 <= r.y || y >= r.bottom()) {
+        if self.painter.output.len() >= self.painter.limit
+            || clip.is_some_and(|r| y + size + 4.0 <= r.y || y >= r.bottom())
+        {
             return;
         }
-        let font = Font::new(size);
-        let unit = font.unit;
-        let colors = [bg, blend(bg, ink, 1, 3), blend(bg, ink, 2, 3), ink];
-        let raster_y = (y * self.scale).round() / self.scale;
-        for ch in text.chars() {
-            if clip.is_some_and(|r| x >= r.right()) {
-                break;
-            }
-            if let Some(glyph) = font.glyph(ch).or_else(|| font.glyph('?')) {
-                let raster_x = (x * self.scale).round() / self.scale;
-                let (runs, _) = glyph.runs.as_chunks::<2>();
-                for &run in runs {
-                    let packed = u16::from_le_bytes(run);
-                    let left = f64::from(packed & 15) - 1.0;
-                    let top = f64::from((packed >> 4) & 31);
-                    let width = f64::from(((packed >> 9) & 15) + 1);
-                    let coverage = usize::from((packed >> 13) & 3);
-                    let rect = Rect::new(
-                        raster_x + left * unit,
-                        raster_y + top * unit,
-                        width * unit,
-                        unit,
-                    );
-                    if let Some(bounds) = clip {
-                        if let Some(rect) = bounds.intersection(rect) {
-                            self.rect(rect, colors[coverage]);
-                        }
-                    } else {
-                        self.rect(rect, colors[coverage]);
+        let physical_px = (size * self.scale).round().max(1.0);
+        let raster_px = raster_px(size, self.raster_scale);
+        let pixel = physical_px / f64::from(raster_px);
+        let raster_y = ((y + (size - 1.0).max(12.0)) * self.scale).round();
+        let colors: [_; COVERAGE_MAX as usize + 1] =
+            std::array::from_fn(|a| blend(bg, ink, a as u16, COVERAGE_MAX));
+        let screen = self.painter.size();
+        let screen = Rect::new(0.0, 0.0, f64::from(screen.width), f64::from(screen.height));
+        let bounds = if let Some(r) = clip {
+            // Use the same pixel-center clip for both painters; never emit a
+            // partial raster cell at a fractional scroll or panel boundary.
+            let edge = |v: f64| (v * self.scale - 0.5).ceil();
+            let (left, top) = (edge(r.x), edge(r.y));
+            let Some(r) = screen.intersection(Rect::new(
+                left,
+                top,
+                edge(r.right()) - left,
+                edge(r.bottom()) - top,
+            )) else {
+                return;
+            };
+            r
+        } else {
+            screen
+        };
+        HUD_GLYPHS.with_borrow_mut(|cache| {
+            for ch in text.chars() {
+                let raster_x = (x * self.scale).round();
+                if raster_x >= bounds.right() || self.painter.output.len() >= self.painter.limit {
+                    break;
+                }
+                for span in cache.glyph(ch, raster_px) {
+                    if let Some(r) = bounds.intersection(span.rect(raster_x, raster_y, pixel)) {
+                        self.painter
+                            .rect(r.x, r.y, r.w, r.h, colors[usize::from(span.alpha)]);
                     }
                 }
-                x += glyph.advance * unit + tracking;
+                x += advance(ch, size) + tracking;
             }
-        }
+        });
     }
 
     fn icon(&mut self, rect: Rect, action: Action, theme: Theme, sound: bool, bg: Color) {
@@ -1636,66 +1773,299 @@ fn blend(bg: Color, fg: Color, p: u16, q: u16) -> Color {
     std::array::from_fn(|i| ((u16::from(bg[i]) * (q - p) + u16::from(fg[i]) * p + q / 2) / q) as u8)
 }
 
-// Unicode-indexed, antialiased horizontal row runs at three native sizes.
-// Both painters use the exact same licensed subset (see assets/hud-glyphs.py).
-const GLYPHS: &[u8] = include_bytes!("../../assets/hud-glyphs.bin");
+const COVERAGE_MAX: u16 = 15;
+const MAX_RASTER_PX: u16 = 128;
+const MAX_FONT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CACHED_GLYPHS: usize = 1024;
+const MAX_CACHED_SPANS: usize = 320_000;
 
-struct Glyph {
-    advance: f64,
-    runs: &'static [u8],
+fn raster_px(size: f64, scale: f64) -> u16 {
+    (size * scale).round().clamp(1.0, f64::from(MAX_RASTER_PX)) as u16
 }
 
-struct Font {
-    data: &'static [u8],
-    unit: f64,
-}
-
-impl Font {
-    fn new(size: f64) -> Self {
-        let (index, em) = if size <= 12.0 {
-            (0, 12.0)
-        } else if size <= 13.0 {
-            (4, 13.0)
-        } else {
-            (8, 15.0)
-        };
-        let offset = u32::from_le_bytes(GLYPHS[index..index + 4].try_into().unwrap()) as usize;
-        Self {
-            data: &GLYPHS[offset..],
-            unit: size / em,
-        }
+// HUD spacing is part of the logical layout, not a property of the installed
+// font. Japanese and the other non-ASCII HUD symbols use a full-width cell.
+fn advance_em(ch: char) -> f64 {
+    match ch {
+        ' ' => 0.225,
+        '.' | ',' => 0.298,
+        '-' => 0.357,
+        '/' => 0.39,
+        '0'..='9' | '^' | '+' => 0.57,
+        'A' => 0.622,
+        'B' => 0.667,
+        'C' => 0.646,
+        'D' => 0.699,
+        'E' => 0.6,
+        'F' | 'e' => 0.566,
+        'G' => 0.701,
+        'H' => 0.741,
+        _ if ch.is_ascii() => 0.62,
+        _ => 1.0,
     }
+}
 
-    fn glyph(&self, ch: char) -> Option<Glyph> {
-        let word = |offset: usize| u16::from_le_bytes([self.data[offset], self.data[offset + 1]]);
-        let count = usize::from(word(0));
-        let (mut lo, mut hi) = (0, count);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let entry = 2 + mid * 8;
-            match u32::from(word(entry)).cmp(&(ch as u32)) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => {
-                    let start = 2 + count * 8 + usize::from(word(entry + 4)) * 2;
-                    let end = start + usize::from(word(entry + 6)) * 2;
-                    return Some(Glyph {
-                        advance: f64::from(word(entry + 2)) / 64.0,
-                        runs: &self.data[start..end],
-                    });
+fn advance(ch: char, size: f64) -> f64 {
+    (advance_em(ch) * size * 64.0).round() / 64.0
+}
+
+fn fonts() -> &'static [FontVec] {
+    static FONTS: OnceLock<Vec<FontVec>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut db = Database::new();
+        db.load_system_fonts();
+        let japanese = [
+            Family::Name("Noto Sans CJK JP"),
+            Family::Name("Noto Sans JP"),
+            Family::Name("Yu Gothic UI"),
+            Family::Name("Yu Gothic"),
+            Family::Name("Meiryo UI"),
+            Family::Name("Meiryo"),
+            Family::Name("Hiragino Sans"),
+            Family::Name("IPA Gothic"),
+            Family::Name("IPAGothic"),
+            Family::Name("TakaoGothic"),
+            Family::Name("MS Gothic"),
+        ];
+        let latin = [
+            Family::Name("Segoe UI"),
+            Family::Name("DejaVu Sans"),
+            Family::Name("Liberation Sans"),
+            Family::Name("Arial"),
+            Family::SansSerif,
+        ];
+        let other_cjk = [
+            Family::Name("Noto Sans CJK SC"),
+            Family::Name("WenQuanYi Zen Hei"),
+        ];
+        let mut fonts = Vec::new();
+        // A local TTC/OTF/TTF override for installs (including Wine) where a
+        // Japanese font directory is not discoverable by the OS catalog.
+        if let Some(path) = std::env::var_os("GAME_8TIMES8_HUD_FONT")
+            && let Some(font) = external_font(Path::new(&path))
+        {
+            fonts.push(font);
+        }
+        let mut loaded = Vec::new();
+        for (cjk, families) in [
+            (true, &japanese[..]),
+            (false, &latin[..]),
+            (true, &other_cjk[..]),
+        ] {
+            if cjk
+                && fonts
+                    .iter()
+                    .any(|font| "機グ垓".chars().all(|ch| font.glyph_id(ch).0 != 0))
+            {
+                continue;
+            }
+            for family in families {
+                let id = db.query(&Query {
+                    families: std::slice::from_ref(family),
+                    weight: Weight::MEDIUM,
+                    ..Query::default()
+                });
+                if let Some(id) = id {
+                    if loaded.contains(&id) {
+                        break;
+                    }
+                    if let Some(Some(font)) = db.with_face_data(id, |data, index| {
+                        if data.len() as u64 > MAX_FONT_BYTES {
+                            return None;
+                        }
+                        FontVec::try_from_vec_and_index(data.to_vec(), index).ok()
+                    }) {
+                        loaded.push(id);
+                        fonts.push(font);
+                        break;
+                    }
                 }
             }
         }
-        None
+        fonts
+    })
+}
+
+fn external_font(path: &Path) -> Option<FontVec> {
+    if !path.is_absolute() {
+        return None;
+    }
+    #[cfg(windows)]
+    if !matches!(path.components().next(), Some(std::path::Component::Prefix(prefix))
+        if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
+    {
+        return None;
+    }
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_FONT_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_FONT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_FONT_BYTES {
+        return None;
+    }
+    FontVec::try_from_vec(bytes).ok()
+}
+
+type GlyphKey = (char, u16);
+
+#[derive(Default)]
+struct GlyphCache {
+    glyphs: HashMap<GlyphKey, Box<[Span]>>,
+    order: VecDeque<GlyphKey>,
+    spans: usize,
+}
+
+thread_local! {
+    static HUD_GLYPHS: RefCell<GlyphCache> = RefCell::new(GlyphCache::default());
+}
+
+impl GlyphCache {
+    fn glyph(&mut self, ch: char, px: u16) -> &[Span] {
+        let key = (ch, px);
+        if !self.glyphs.contains_key(&key) {
+            self.insert(key, rasterize(ch, px));
+        }
+        &self.glyphs[&key]
+    }
+
+    fn insert(&mut self, key: GlyphKey, spans: Box<[Span]>) {
+        while self.glyphs.len() >= MAX_CACHED_GLYPHS || self.spans + spans.len() > MAX_CACHED_SPANS
+        {
+            let old = self.order.pop_front().unwrap();
+            self.spans -= self.glyphs.remove(&old).unwrap().len();
+        }
+        self.spans += spans.len();
+        self.order.push_back(key);
+        self.glyphs.insert(key, spans);
+    }
+}
+
+fn font_glyph(ch: char) -> Option<(&'static FontVec, ab_glyph::GlyphId)> {
+    fonts().iter().find_map(|font| {
+        let id = font.glyph_id(ch);
+        (id.0 != 0).then_some((font, id))
+    })
+}
+
+fn rasterize(ch: char, px: u16) -> Box<[Span]> {
+    if ch.is_whitespace() {
+        return Box::default();
+    }
+    let Some((font, id)) = font_glyph(ch).or_else(|| font_glyph('?')) else {
+        return Box::default();
+    };
+    let Some(em) = font.units_per_em() else {
+        return Box::default();
+    };
+    let ppem = f32::from(px);
+    let advance = advance_em(ch) as f32;
+    let natural = (font.h_advance_unscaled(id) / em).max(0.01);
+    let scale = ppem * font.height_unscaled() / em;
+    let scale = PxScale {
+        x: scale * (advance / natural).min(1.0),
+        y: scale,
+    };
+    let x = ((advance - natural).max(0.0) * 0.5 * ppem).round();
+    let Some(glyph) = font.outline_glyph(id.with_scale_and_position(scale, point(x, 0.0))) else {
+        return Box::default();
+    };
+    let bounds = glyph.px_bounds();
+    let (w, h) = (bounds.width() as usize, bounds.height() as usize);
+    let bound = f32::from(MAX_RASTER_PX) * 2.0;
+    if w == 0
+        || h == 0
+        || [bounds.min.x, bounds.min.y, bounds.max.x, bounds.max.y]
+            .into_iter()
+            .any(|edge| !edge.is_finite() || edge.abs() > bound)
+    {
+        return Box::default();
+    }
+    let mut pixels = vec![0; w * h];
+    glyph.draw(|x, y, a| {
+        pixels[y as usize * w + x as usize] =
+            (a.clamp(0.0, 1.0) * f32::from(COVERAGE_MAX)).round() as u8;
+    });
+    coalesce_rows(&pixels, w, bounds.min.x as i16, bounds.min.y as i16).into_boxed_slice()
+}
+
+fn coalesce_rows(pixels: &[u8], width: usize, left: i16, top: i16) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    let (mut previous, mut current): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+    for (y, row) in pixels.chunks_exact(width).enumerate() {
+        let (mut x, mut prev) = (0, 0);
+        while x < width {
+            let a = row[x];
+            let end = x + 1 + row[x + 1..].iter().take_while(|&&p| p == a).count();
+            if a != 0 {
+                let left = left + x as i16;
+                let w = (end - x) as u16;
+                while prev < previous.len() && spans[previous[prev]].left < left {
+                    prev += 1;
+                }
+                if let Some(&index) = previous.get(prev)
+                    && spans[index].left == left
+                    && spans[index].w == w
+                    && spans[index].alpha == a
+                {
+                    spans[index].h += 1;
+                    current.push(index);
+                } else {
+                    current.push(spans.len());
+                    spans.push(Span {
+                        left,
+                        top: top + y as i16,
+                        w,
+                        h: 1,
+                        alpha: a,
+                    });
+                }
+            }
+            x = end;
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.clear();
+    }
+    spans
+}
+
+// Both painters use these equal-coverage physical row runs. Vertical
+// coalescing merges consecutive identical runs without changing any pixels.
+struct Span {
+    left: i16,
+    top: i16,
+    w: u16,
+    h: u16,
+    alpha: u8,
+}
+
+impl Span {
+    fn rect(&self, x: f64, y: f64, pixel: f64) -> Rect {
+        let (left, top) = (f64::from(self.left), f64::from(self.top));
+        let (width, height) = (f64::from(self.w), f64::from(self.h));
+        // Native pixels unless a size or Painter budget guard requests a
+        // lower-density raster for the same physical layout.
+        if pixel == 1.0 {
+            return Rect::new(x + left, y + top, width, height);
+        }
+        let edge = |v: f64| (v * pixel).round();
+        let (dx, dy) = (edge(left), edge(top));
+        Rect::new(
+            x + dx,
+            y + dy,
+            edge(left + width) - dx,
+            edge(top + height) - dy,
+        )
     }
 }
 
 fn text_width(text: &str, size: f64) -> f64 {
-    let font = Font::new(size);
-    text.chars()
-        .filter_map(|ch| font.glyph(ch).or_else(|| font.glyph('?')))
-        .map(|glyph| glyph.advance * font.unit)
-        .sum()
+    text.chars().map(|ch| advance(ch, size)).sum()
 }
 
 fn tracked_width(text: &str, size: f64, tracking: f64) -> f64 {
@@ -1733,6 +2103,7 @@ mod tests {
         assert!(layout.item.is_none());
         assert_eq!(hud.hit(DESKTOP, 1.0, [24.0, 27.0]), Some(Action::Block));
         assert_eq!(hud.hit(DESKTOP, 1.0, [50.0, 57.0]), Some(Action::Shop));
+        #[cfg(debug_assertions)]
         assert_eq!(hud.hit(DESKTOP, 1.0, [790.0, 25.0]), Some(Action::Debug));
         assert_eq!(hud.hit(DESKTOP, 1.0, [419.0, 320.0]), None);
         assert!(!hud.scroll(DESKTOP, 1.0, [419.0, 320.0], -40.0));
@@ -1802,13 +2173,19 @@ mod tests {
         assert!(layout.status.fits(badge));
         assert!(shop.y > badge.bottom());
         assert_eq!(hud.hit(tight, 1.0, center(badge, 1.0)), Some(Action::Block));
-        hud.toggle_debug();
-        let debug = hud.layout(tight, 1.0).unwrap().debug.unwrap();
-        assert!(debug.view.rect.intersection(badge).is_none());
+        #[cfg(debug_assertions)]
+        {
+            hud.toggle_debug();
+            let debug = hud.layout(tight, 1.0).unwrap().debug.unwrap();
+            assert!(debug.view.rect.intersection(badge).is_none());
+        }
     }
 
     #[test]
     fn shared_painter_receives_counter_and_japanese_button_glyphs() {
+        if font_glyph('機').is_none() {
+            return;
+        }
         let game = Game::new();
         let mut hud = Hud::default();
         hud.update(&game);
@@ -1881,7 +2258,10 @@ mod tests {
         assert_eq!(manual.caption, "強化 8A");
         assert_eq!(manual.description, "現在：1枚／回 → 次：2枚／回");
         assert_eq!(hud.tab(DESKTOP, 1.0, false), Some(Action::Shop));
+        #[cfg(debug_assertions)]
         assert_eq!(hud.tab(DESKTOP, 1.0, false), Some(Action::Debug));
+        #[cfg(not(debug_assertions))]
+        assert_eq!(hud.tab(DESKTOP, 1.0, false), Some(Action::Theme));
 
         assert!(game.apply(
             Target::Tile {
@@ -1952,6 +2332,7 @@ mod tests {
         assert!(hud.focused_action().is_none());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn debug_wheel_and_confirmation_have_separate_targets() {
         let tiny = PhysicalSize::new(320, 240);
@@ -1983,8 +2364,37 @@ mod tests {
         assert_eq!(hud.hit(tiny, 1.0, find(&hud, paste).unwrap()), Some(paste));
     }
 
+    #[cfg(not(debug_assertions))]
     #[test]
-    fn atlas_covers_all_japanese_labels_and_number_formatting() {
+    fn release_has_no_debug_drawing_or_hit_target() {
+        let game = Game::new();
+        let mut hud = Hud {
+            hint: false,
+            ..Hud::default()
+        };
+        hud.update(&game);
+        let point = [790.0, 25.0];
+        assert_eq!(hud.hit(DESKTOP, 1.0, point), None);
+        assert!(!hud.scroll(DESKTOP, 1.0, point, 1.0));
+        assert_eq!(hud.tab(DESKTOP, 1.0, false), Some(Action::Shop));
+        assert_eq!(hud.tab(DESKTOP, 1.0, false), Some(Action::Theme));
+
+        let mut output = Vec::new();
+        let mut painter = Painter {
+            output: &mut output,
+            size: DESKTOP,
+            limit: 16_384,
+        };
+        hud.paint(&mut painter, &game, Theme::Light, 1.0, Some(point));
+        let old_debug_left = 766.0 * 2.0 / DESKTOP.width as f32 - 1.0;
+        let old_debug_bottom = 1.0 - 44.0 * 2.0 / DESKTOP.height as f32;
+        assert!(!output.iter().any(|instance| {
+            instance.rect[0] >= old_debug_left && instance.rect[1] >= old_debug_bottom
+        }));
+    }
+
+    #[test]
+    fn number_formatting_and_layout_do_not_require_system_fonts() {
         assert_eq!(points_label(999_999_999, Level::A), "999,999,999A");
         assert_eq!(points_label(1_021_000_000, Level::B), "10.21億B");
         assert_eq!(
@@ -1996,17 +2406,201 @@ mod tests {
         assert_eq!(capacity_label(6), "1A");
         assert_eq!(capacity_label(11), "32A");
         assert_eq!(capacity_label(24), "1D");
-        for size in [12.0, 13.0, 15.0] {
-            let font = Font::new(size);
-            for ch in include_str!("hud.rs").chars().filter(|ch| !ch.is_ascii()) {
-                let glyph = font
-                    .glyph(ch)
-                    .unwrap_or_else(|| panic!("missing HUD glyph: {ch}"));
-                assert!(
-                    ch.is_whitespace() || !glyph.runs.is_empty(),
-                    "empty HUD glyph: {ch}"
-                );
+        assert_eq!(text_width("機械", 13.0), 26.0);
+        assert_eq!(text_width("0A", 15.0), 17.875);
+    }
+
+    #[test]
+    fn native_rasters_and_logical_layout_remain_independent() {
+        let mut hud = Hud::default();
+        hud.update(&Game::new());
+        hud.set_save_blocked(true);
+        hud.toggle_shop();
+        let base = hud.layout(DESKTOP, 1.0).unwrap();
+        let dims = |rect: Rect| [rect.x, rect.y, rect.w, rect.h];
+        for dpi in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0] {
+            for size in [12.0, 13.0, 15.0] {
+                assert_eq!(raster_px(size, dpi), (size * dpi).round() as u16);
             }
+            let size = PhysicalSize::new(
+                (f64::from(DESKTOP.width) * dpi) as u32,
+                (f64::from(DESKTOP.height) * dpi) as u32,
+            );
+            let layout = hud.layout(size, dpi).unwrap();
+            assert_eq!(layout.points, base.points);
+            assert_eq!(dims(layout.status), dims(base.status));
+            assert_eq!(
+                dims(layout.save_warning.unwrap()),
+                dims(base.save_warning.unwrap())
+            );
+            assert_eq!(dims(layout.shop_button), dims(base.shop_button));
+            assert_eq!(
+                dims(layout.shop.unwrap().clip),
+                dims(base.shop.unwrap().clip)
+            );
+            assert_eq!(
+                hud.hit(size, dpi, center(layout.shop_button, dpi)),
+                Some(Action::Shop)
+            );
         }
+        assert_eq!(raster_px(12.0, 1.4), 17);
+        assert_eq!(raster_px(15.0, 999.0), MAX_RASTER_PX);
+    }
+
+    #[test]
+    fn japanese_glyph_paints_more_physical_cells_with_dpi() {
+        if font_glyph('機').is_none() {
+            return;
+        }
+        let mut previous = 0.0;
+        for dpi in [1.0, 1.5, 2.0] {
+            let mut output = Vec::new();
+            let mut painter = Painter {
+                output: &mut output,
+                size: DESKTOP,
+                limit: 16_384,
+            };
+            let mut draw = Draw {
+                painter: &mut painter,
+                scale: dpi,
+                raster_scale: dpi,
+                colors: Palette::for_theme(Theme::Light),
+                hover: None,
+                focus: None,
+            };
+            draw.text("機", 24.0, 23.0, 12.0, [0; 3], [255; 3], None);
+            let mut colors = [false; 256];
+            let mut pixels = 0.0;
+            for instance in &output {
+                let [w, h, _, _] = instance.shape;
+                assert!(w >= 1.0 && w.fract() == 0.0);
+                assert!(h >= 1.0 && h.fract() == 0.0);
+                pixels += w * h;
+                colors[(instance.color[0] * 255.0).round() as usize] = true;
+            }
+            assert!(pixels > previous, "DPI {dpi}: {pixels} <= {previous}");
+            assert!(colors.into_iter().filter(|&present| present).count() > 4);
+            eprintln!("DPI {dpi}: {pixels} covered pixels for 機");
+            previous = pixels;
+        }
+    }
+
+    #[test]
+    fn intermediate_dpi_clips_glyphs_on_the_physical_grid() {
+        if font_glyph('機').is_none() {
+            return;
+        }
+        let dpi = 1.4;
+        let clip = Rect::new(94.4, 91.6, 5.9, 8.9);
+        let mut output = Vec::new();
+        let mut painter = Painter {
+            output: &mut output,
+            size: DESKTOP,
+            limit: 16_384,
+        };
+        let mut draw = Draw {
+            painter: &mut painter,
+            scale: dpi,
+            raster_scale: dpi,
+            colors: Palette::for_theme(Theme::Light),
+            hover: None,
+            focus: None,
+        };
+        draw.text("機械", 92.0, 89.0, 12.0, [0; 3], [255; 3], Some(clip));
+        assert!(!output.is_empty());
+        let edge = |v: f64| (v * dpi - 0.5).ceil();
+        for instance in output {
+            let (w, h) = (f64::from(instance.shape[0]), f64::from(instance.shape[1]));
+            let x = (f64::from(instance.rect[0]) + 1.0) * f64::from(DESKTOP.width) / 2.0;
+            let y = (1.0 - f64::from(instance.rect[1])) * f64::from(DESKTOP.height) / 2.0;
+            assert!(w >= 1.0 && w.fract() == 0.0 && (x - x.round()).abs() < 0.001);
+            assert!(h >= 1.0 && h.fract() == 0.0 && (y - y.round()).abs() < 0.001);
+            assert!(x.round() >= edge(clip.x) && x.round() + w <= edge(clip.right()));
+            assert!(y.round() >= edge(clip.y) && y.round() + h <= edge(clip.bottom()));
+        }
+    }
+
+    #[test]
+    fn equal_rows_merge_and_the_cache_evicts_old_entries() {
+        let spans = coalesce_rows(&[0, 7, 7, 0, 7, 7, 0, 8, 8], 3, -1, -4);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            (
+                spans[0].left,
+                spans[0].top,
+                spans[0].w,
+                spans[0].h,
+                spans[0].alpha
+            ),
+            (0, -4, 2, 2, 7)
+        );
+        assert_eq!((spans[1].top, spans[1].h, spans[1].alpha), (-2, 1, 8));
+        let mut cache = GlyphCache::default();
+        for px in 0..=MAX_CACHED_GLYPHS as u16 {
+            cache.insert(('a', px), Box::default());
+        }
+        assert_eq!(cache.glyphs.len(), MAX_CACHED_GLYPHS);
+        assert!(!cache.glyphs.contains_key(&('a', 0)));
+    }
+
+    #[test]
+    fn dense_high_dpi_shop_keeps_later_controls_within_the_hud_reserve() {
+        let game = Game::new();
+        let mut hud = Hud::default();
+        hud.update(&game);
+        hud.set_save_blocked(true);
+        hud.set_machine_rows(
+            (1..=5)
+                .map(|tier| {
+                    let letter = letter(Level::ALL[tier - 1]);
+                    MachineTier {
+                        tier,
+                        owned: 4,
+                        limit: 4,
+                        legacy: 0,
+                        body: None,
+                        machines: (0..4)
+                            .map(|id| MachineRow {
+                                id,
+                                current: format!("16{letter}"),
+                                next: Some(format!("32{letter}")),
+                                cost: format!("2.55e38{letter}"),
+                                enabled: true,
+                            })
+                            .collect(),
+                    }
+                })
+                .collect(),
+        );
+        hud.toggle_shop();
+
+        // Give the HUD exactly what would remain after a full board pass.
+        const RESERVE: usize = 32 * 1024;
+        let size = PhysicalSize::new(3840, 2880);
+        let dpi = 4.0;
+        let paint = |limit| {
+            let mut output = Vec::new();
+            let mut painter = Painter {
+                output: &mut output,
+                size,
+                limit,
+            };
+            painter.rect(19.0, 35.0, 1.0, 1.0, [7; 3]);
+            hud.paint(&mut painter, &game, Theme::Light, dpi, None);
+            output
+        };
+        let full = paint(1 << 18);
+        let reserved = paint(RESERVE + 1);
+        eprintln!(
+            "4x shop: {} native instances, {} with reserve",
+            full.len() - 1,
+            reserved.len() - 1
+        );
+        assert!(reserved.len() <= full.len());
+        assert!(reserved.len() < RESERVE + 1, "saturated the painter");
+        assert_eq!(reserved[0].rect, full[0].rect);
+        // The last drawing commands are for Home, after the dense shop text.
+        assert_eq!(reserved.last().unwrap().rect, full.last().unwrap().rect);
+        assert_eq!(reserved.last().unwrap().color, full.last().unwrap().color);
     }
 }

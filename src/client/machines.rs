@@ -17,8 +17,10 @@ const WORLD_TILE: f64 = 28.0;
 const WORLD_BLOCK_GAP: f64 = 8.0;
 const TILES_PER_WORLD: f64 = 8.0 / WORLD_PITCH;
 // An old save can contain the normal purchase slots and at most four v1 extras.
+#[cfg(any(debug_assertions, test))]
 const LEGACY_IMPORT_LIMIT: usize = TIERS.len() * MACHINES_PER_TIER + 4;
 // Divide last so the boundary also accepts callers that compute x * 8 / 253.
+#[cfg(any(debug_assertions, test))]
 const LEGACY_POSITION_LIMIT: f64 = ((1u64 << 53) - 1) as f64 * 8.0 / WORLD_PITCH;
 const REST: Duration = Duration::from_millis(380);
 const IDLE: Duration = Duration::from_secs(1);
@@ -177,11 +179,13 @@ impl Machines {
     }
 
     /// An in-flight action still lands after pausing, like the reference.
+    #[cfg(any(debug_assertions, test))]
     pub(super) fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
     }
 
     /// Speed changes do not reschedule an action that is already in flight.
+    #[cfg(any(debug_assertions, test))]
     pub(super) fn set_speed(&mut self, speed: f64) {
         if (1.0..=10.0).contains(&speed) {
             self.speed = Some(speed);
@@ -286,6 +290,7 @@ impl Machines {
 
     /// Restores an ordered list from an old save, with positions already
     /// converted by the parser to the client's eight-step 1A tile space.
+    #[cfg(any(debug_assertions, test))]
     pub(super) fn import_legacy(
         bots: Vec<(Level, u32, bool, [f64; 2])>,
         now: Instant,

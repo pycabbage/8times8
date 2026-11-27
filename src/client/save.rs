@@ -15,6 +15,7 @@ const VERSION: u16 = 1;
 const HEADER_LEN: usize = 60;
 const TRAILER_LEN: usize = 4;
 const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
+#[cfg(any(debug_assertions, test))]
 const CLIPBOARD_PREFIX: &str = "8times8-save-v1:";
 const DARK: u8 = 1;
 const SOUND: u8 = 2;
@@ -76,6 +77,7 @@ pub(super) fn store_validated(
 }
 
 /// Encode the native save container for debug copy/paste, not legacy JSON.
+#[cfg(any(debug_assertions, test))]
 pub(super) fn to_clipboard(state: &Saved) -> Result<String, String> {
     let header = encode_header(state).map_err(str::to_owned)?;
     let byte_len = HEADER_LEN + state.board.len() + state.machines.len() + TRAILER_LEN;
@@ -90,6 +92,7 @@ pub(super) fn to_clipboard(state: &Saved) -> Result<String, String> {
     Ok(text)
 }
 
+#[cfg(any(debug_assertions, test))]
 fn append_hex(text: &mut String, bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for &byte in bytes {
@@ -98,6 +101,7 @@ fn append_hex(text: &mut String, bytes: &[u8]) {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 pub(super) fn from_clipboard(text: &str) -> Result<Saved, String> {
     let hex = text
         .strip_prefix(CLIPBOARD_PREFIX)
@@ -108,6 +112,7 @@ pub(super) fn from_clipboard(text: &str) -> Result<Saved, String> {
         .map_err(|err| err.to_string())
 }
 
+#[cfg(any(debug_assertions, test))]
 fn clipboard_byte_len(hex_len: usize) -> Result<usize, &'static str> {
     let overhead = HEADER_LEN + TRAILER_LEN;
     if hex_len > 2 * (overhead + MAX_PAYLOAD) {
@@ -119,8 +124,10 @@ fn clipboard_byte_len(hex_len: usize) -> Result<usize, &'static str> {
     Ok(hex_len / 2)
 }
 
+#[cfg(any(debug_assertions, test))]
 struct HexReader<'a>(&'a [u8]);
 
+#[cfg(any(debug_assertions, test))]
 impl Read for HexReader<'_> {
     fn read(&mut self, dest: &mut [u8]) -> io::Result<usize> {
         fn nibble(byte: u8) -> io::Result<u8> {

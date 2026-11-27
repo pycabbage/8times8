@@ -266,6 +266,17 @@ fn ease_out(t: f64) -> f64 {
     1.0 - (1.0 - t).powi(3)
 }
 
+fn smoothstep(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+// A one-pixel face cannot reliably represent a two-cell period. Restore
+// local contrast gradually, with the original coarse geometry by two pixels.
+fn resolved_detail(face_px: f64) -> f64 {
+    smoothstep(face_px - 1.0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rect {
     left: f64,
@@ -310,6 +321,38 @@ impl Rect {
         let dx = ((x - self.left - self.w * 0.5).abs() - (self.w * 0.5 - radius)).max(0.0);
         let dy = ((y - self.top - self.h * 0.5).abs() - (self.h * 0.5 - radius)).max(0.0);
         dx * dx + dy * dy <= radius * radius
+    }
+
+    fn short_side(self) -> f64 {
+        self.w.min(self.h)
+    }
+
+    fn area(self) -> f64 {
+        let radius = self.radius.min(self.short_side() * 0.5);
+        self.w * self.h - (4.0 - PI) * radius * radius
+    }
+
+    fn whole_pixels(self) -> Self {
+        let left = self.left.ceil();
+        let top = self.top.ceil();
+        Self {
+            left,
+            top,
+            w: (self.left + self.w).floor() - left,
+            h: (self.top + self.h).floor() - top,
+            radius: 0.0,
+        }
+    }
+
+    fn separated_outline(self, width: f64, gap: f64) -> (Self, f64) {
+        // Fit previews inside their slots. Where the face is big enough, leave
+        // a full physical pixel between neighboring strokes' AA footprints.
+        let quarter = self.short_side() * 0.25;
+        let width = width.min(quarter);
+        let inset = ((width + 1.0 - gap) * 0.5).max(0.0).min(quarter);
+        let mut outline = self.padded(-inset);
+        outline.radius = (outline.radius - inset).max(0.0);
+        (outline, width)
     }
 
     fn fill(self, p: &mut Painter<'_>, color: Color) {
@@ -515,9 +558,37 @@ impl View {
             .all(|point| inner.contains(point))
     }
 
+    fn preview_outline(
+        &self,
+        p: &mut Painter<'_>,
+        rect: Rect,
+        width: f64,
+        gap: f64,
+        bg: Color,
+        ink: Color,
+    ) {
+        let detail = resolved_detail(rect.short_side());
+        let color = if detail == 1.0 {
+            ink
+        } else {
+            mix(bg, ink, detail)
+        };
+        if color != bg {
+            let (rect, width) = rect.separated_outline(width, gap);
+            self.outline(p, rect, width, color);
+        }
+    }
+
     fn cells(&self, coord: Coord, coarse: bool, pad: f64) -> Cells {
         let origin = self.origin(coord);
         let stride = STEP * self.px;
+        let stride = if coarse {
+            let solid_stride = (self.pitch_px - GUTTER * self.px) / 8.0;
+            let detail = resolved_detail(FACE * self.px);
+            solid_stride + (stride - solid_stride) * detail
+        } else {
+            stride
+        };
         let side = if coarse { stride } else { FACE * self.px };
         let range = |i: usize| {
             let start = ((-origin[i] - pad - side) / stride).floor() + 1.0;
@@ -594,10 +665,84 @@ impl Cells {
             self.radius,
         )
     }
+
+    fn footprint(&self) -> Rect {
+        Rect::square(self.origin, 8.0 * self.stride, 0.0)
+    }
+
+    fn coarse_runs(&self, mask: u64, mut emit: impl FnMut(Rect, bool)) {
+        let cols =
+            ((1u64 << (self.cols.end.saturating_sub(self.cols.start))) - 1) << self.cols.start;
+        let mut remaining = self
+            .rows
+            .clone()
+            .fold(0, |bits, row| bits | (cols << (row * 8)));
+        while remaining != 0 {
+            let index = remaining.trailing_zeros();
+            let black = mask & (1u64 << index) != 0;
+            let matching = remaining & if black { mask } else { !mask };
+            let col = index % 8;
+            let len = (matching >> index).trailing_ones().min(8 - col);
+            let mut run = ((1u64 << len) - 1) << index;
+            remaining &= !run;
+
+            // Grow the same horizontal run down through matching rows. This
+            // avoids drawing a coverage edge between equal-color tile rows.
+            let row = index / 8;
+            let mut height = 1;
+            while row + height < 8 {
+                run <<= 8;
+                if matching & run != run {
+                    break;
+                }
+                remaining &= !run;
+                height += 1;
+            }
+            let mut face = self.face(col as u8, row as u8);
+            face.w = f64::from(len) * self.stride;
+            face.h = f64::from(height) * self.stride;
+            emit(face, black);
+        }
+    }
 }
 
 fn whole_block(mask: u64, detail: Detail) -> bool {
     (mask == 0 && detail.coarse) || (mask == u64::MAX && !detail.fine_done)
+}
+
+fn coarse_faces(
+    view: &View,
+    coord: Coord,
+    mask: u64,
+    white: Color,
+    black: Color,
+    mut emit: impl FnMut(Rect, Color),
+) {
+    // Equal-area mask samples, averaged in the existing opaque display RGB
+    // palette (not a linear-light average or a screen-sized filter pass).
+    let coverage = f64::from(mask.count_ones()) / 64.0;
+    let detail = resolved_detail(FACE * view.px);
+    if detail == 0.0 {
+        emit(view.footprint(coord, 0.0), mix(white, black, coverage));
+        return;
+    }
+    let cells = view.cells(coord, true, 0.0);
+    let footprint = cells.footprint();
+    let base = (1.0 - detail) * coverage;
+    let white_ink = mix(white, black, base);
+    let black_ink = mix(white, black, base + detail);
+    if white_ink == black_ink {
+        emit(footprint, white_ink);
+        return;
+    }
+
+    // Two abutting rectangles share fractional coverage, but the painter
+    // composites each edge independently. Prevent interior seams from exposing
+    // the board background; leave the fractional outside edge to the painter.
+    emit(footprint.whole_pixels(), mix(white, black, coverage));
+    cells.coarse_runs(mask, |face, flipped| {
+        emit(face, if flipped { black_ink } else { white_ink })
+    });
 }
 
 fn paint_block(p: &mut Painter<'_>, view: &View, coord: Coord, block: Block, style: &Style<'_>) {
@@ -621,24 +766,18 @@ fn paint_block(p: &mut Painter<'_>, view: &View, coord: Coord, block: Block, sty
         view.fill(p, view.footprint(coord, radius), color(mask != 0));
         return;
     }
+    if view.detail.coarse {
+        coarse_faces(view, coord, mask, white, black, |face, ink| {
+            view.fill(p, face, ink)
+        });
+        return;
+    }
 
-    let cells = view.cells(coord, view.detail.coarse, 0.0);
+    let cells = view.cells(coord, false, 0.0);
     for row in cells.rows.clone() {
-        let flipped = |col: u8| mask & (1u64 << (row * 8 + col)) != 0;
-        let mut col = cells.cols.start;
-        while col < cells.cols.end {
-            let black = flipped(col);
-            let mut face = cells.face(col, row);
+        for col in cells.cols.clone() {
+            let face = cells.face(col, row);
             let index = row * 8 + col;
-            col += 1;
-            if view.detail.coarse {
-                // Adjacent filled cells at this zoom have no gap; coalesce runs.
-                let start = col - 1;
-                while col < cells.cols.end && flipped(col) == black {
-                    col += 1;
-                }
-                face.w = f64::from(col - start) * cells.stride;
-            }
             if let Some(time) = turn.and_then(|motion| {
                 motion
                     .tile_flips(coord)
@@ -647,7 +786,7 @@ fn paint_block(p: &mut Painter<'_>, view: &View, coord: Coord, block: Block, sty
                 let (face, ink) = style.flip(face, time);
                 view.fill(p, face, style.fade(coord, ink));
             } else {
-                view.fill(p, face, color(black));
+                view.fill(p, face, color(mask & (1 << index) != 0));
             }
         }
     }
@@ -691,10 +830,9 @@ fn paint_large(
 ) {
     let face = view.large(coord, in_large_group(game, coord));
     let color = style.face(coord, false);
-    if color == style.colors.bg {
+    if color == style.colors.bg || !view.visible(face) {
         return;
     }
-    view.fill(p, face, color);
     if work != 0
         && style
             .motion
@@ -702,16 +840,26 @@ fn paint_large(
             .is_none()
     {
         let progress = (work as f64 / coord.level().tile_capacity() as f64).sqrt();
-        let side = face.w.min(face.h) * progress;
+        let side = face.short_side() * progress;
         let center = [
             face.left + (face.w - side) * 0.5,
             face.top + (face.h - side) * 0.5,
         ];
-        view.fill(
-            p,
-            Rect::square(center, side, face.radius * progress),
-            style.colors.black,
-        );
+        let mark = Rect::square(center, side, face.radius * progress);
+        let detail = resolved_detail(face.short_side());
+        let base = if detail == 1.0 {
+            0.0
+        } else {
+            (1.0 - detail) * (mark.area() / face.area())
+        };
+        let body_ink = mix(color, style.colors.black, base);
+        let mark_ink = mix(color, style.colors.black, base + detail);
+        view.fill(p, face, body_ink);
+        if mark_ink != body_ink {
+            view.fill(p, mark, mark_ink);
+        }
+    } else {
+        view.fill(p, face, color);
     }
 }
 
@@ -951,24 +1099,39 @@ fn paint_frame(
 
     for coord in scene.sections {
         let width = 1.0 + 0.6 * f64::from(coord.level() as u8 - Level::B as u8);
-        view.outline(p, section_rect(&view, coord), width, colors.section);
+        view.preview_outline(
+            p,
+            section_rect(&view, coord),
+            width,
+            (GUTTER - 2.0 * FRAME_PAD) * view.px,
+            colors.bg,
+            colors.section,
+        );
     }
     for coord in scene.ghosts {
+        let gap = if view.detail.coarse {
+            GUTTER
+        } else {
+            STEP - FACE
+        } * view.px;
         ghost_shapes(&view, coord, |rect| {
-            view.outline(p, rect, 1.0, colors.ghost)
+            view.preview_outline(p, rect, 1.0, gap, colors.bg, colors.ghost)
         });
     }
     for group in scene.big_ghosts {
         let level = group.level().child().expect("large group contains tiles");
+        let gap = span(level) as f64 * view.pitch_px * (STEP - FACE) / STEP;
         if let Some(visible) = Area::around(group, level).intersect(viewport.at_level(level)) {
             for coord in visible
                 .coords(level)
                 .filter(|&coord| !game.unit_present(coord))
             {
-                view.outline(
+                view.preview_outline(
                     p,
                     view.large(coord, in_large_group(game, coord)),
                     1.0,
+                    gap,
+                    colors.bg,
                     colors.ghost,
                 );
             }
@@ -1017,6 +1180,14 @@ fn paint_halos(p: &mut Painter<'_>, view: &View, game: &Game, motion: Motion<'_>
             continue;
         };
         let e = ease_out(t);
+        let tint = mix(
+            colors.bg,
+            colors.halo,
+            0.22 * (1.0 - t).powi(2) * resolved_detail(view.footprint(coord, 0.0).w),
+        );
+        if tint == colors.bg {
+            continue;
+        }
         let group = game.large_group(coord);
         let tier = coord.level() as u8;
         let (pad, radius, stroke) = if tier > 0 && !group {
@@ -1040,12 +1211,7 @@ fn paint_halos(p: &mut Painter<'_>, view: &View, game: &Game, motion: Motion<'_>
         let rect = view
             .footprint(coord, radius + pad * 0.3)
             .padded(pad * view.px);
-        view.outline(
-            p,
-            rect,
-            stroke,
-            mix(colors.bg, colors.halo, 0.22 * (1.0 - t).powi(2)),
-        );
+        view.outline(p, rect, stroke, tint);
     }
 
     for (&coord, &at) in &motion.effects.opened {
@@ -1055,7 +1221,9 @@ fn paint_halos(p: &mut Painter<'_>, view: &View, game: &Game, motion: Motion<'_>
         if game.unit_complete(coord) {
             continue;
         }
-        let pulse = (0.5 - 0.5 * (TAU * t * 3.0).cos()) * (1.0 - t);
+        let pulse = (0.5 - 0.5 * (TAU * t * 3.0).cos())
+            * (1.0 - t)
+            * resolved_detail(view.footprint(coord, 0.0).w);
         let tint = mix(colors.bg, colors.halo, 0.35 * pulse);
         if tint == colors.bg {
             continue;
@@ -1080,6 +1248,13 @@ fn circle([x, y]: [f64; 2], radius: f64) -> Rect {
     Rect::square([x - radius, y - radius], radius * 2.0, radius)
 }
 
+// Attenuate rings that would otherwise double-ink the same pixels.
+// The stronger (or fixed) ring remains; the other regains full contrast once
+// the outer AA bands no longer intersect.
+fn ring_detail(radius_gap: f64, width: f64, other_width: f64) -> f64 {
+    smoothstep(radius_gap.abs() / ((width + other_width) * 0.5 + 1.0))
+}
+
 fn item_geometry(view: &View, coord: Coord) -> ([f64; 2], f64) {
     let rect = view.footprint(coord, 0.0);
     let center = [rect.left + rect.w * 0.5, rect.top + rect.h * 0.5];
@@ -1098,15 +1273,21 @@ pub(super) fn item_visible(camera: Camera, size: PhysicalSize<u32>, game: &Game)
 
 fn paint_pickup(p: &mut Painter<'_>, view: &View, coord: Coord, t: f64, colors: &Colors) {
     let (center, size) = item_geometry(view, coord);
-    for ring in 0..4 {
+    let mut previous = None;
+    // Inner rings are younger and brighter. Attenuate weaker rings near them.
+    for ring in (0..4).rev() {
         let phase = t * 1.25 - f64::from(ring) * 0.12;
         if (0.0..1.0).contains(&phase) {
-            view.outline(
-                p,
-                circle(center, size * (0.4 + 2.2 * ease_out(phase))),
-                2.2 - 0.4 * f64::from(ring),
-                mix(colors.bg, colors.halo, 0.5 * (1.0 - phase)),
-            );
+            let radius = size * (0.4 + 2.2 * ease_out(phase));
+            let width = 2.2 - 0.4 * f64::from(ring);
+            let detail = previous.map_or(1.0, |(inner, stroke)| {
+                ring_detail(radius - inner, width, stroke)
+            });
+            let color = mix(colors.bg, colors.halo, 0.5 * (1.0 - phase) * detail);
+            if color != colors.bg {
+                view.outline(p, circle(center, radius), width, color);
+                previous = Some((radius, width));
+            }
         }
     }
 }
@@ -1134,20 +1315,21 @@ fn paint_item(p: &mut Painter<'_>, view: &View, coord: Coord, style: &Style<'_>)
         return;
     }
     let colors = &style.colors;
+    let accent_radius = size * 0.62;
     for ring in 0..3 {
         let phase = (time / 2.8 + f64::from(ring) / 3.0).fract();
         let radius = (0.55 + 1.15 * phase) * size;
-        let alpha = 0.32 * (PI * phase).sin() * opacity;
-        view.outline(
-            p,
-            circle(center, radius),
-            1.6,
-            mix(colors.bg, colors.halo, alpha),
-        );
+        let alpha =
+            0.32 * (PI * phase).sin() * opacity * ring_detail(radius - accent_radius, 1.6, 1.0);
+        let color = mix(colors.bg, colors.halo, alpha);
+        if color == colors.bg {
+            continue;
+        }
+        view.outline(p, circle(center, radius), 1.6, color);
     }
     view.outline(
         p,
-        circle(center, size * 0.62),
+        circle(center, accent_radius),
         1.0,
         mix(colors.bg, colors.halo, 0.22 * opacity),
     );
@@ -1263,6 +1445,136 @@ mod tests {
         let coarse = view_at(2.0);
         let cells = coarse.cells(ORIGIN, true, 0.0);
         assert_eq!(cells.side, cells.stride);
+        assert_eq!(cells.stride, STEP * coarse.px);
+    }
+
+    const CHECKER: u64 = 0xaa55_aa55_aa55_aa55;
+    const VERTICAL: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+    const HORIZONTAL: u64 = 0x0000_0000_ffff_ffff;
+
+    #[test]
+    fn subpixel_masks_render_one_face_with_the_same_area_tone() {
+        for face_px in [0.002, 0.5, 1.0] {
+            let view = view_at(face_px);
+            for (theme, expected) in [(Theme::Light, [149; 3]), (Theme::Dark, [123, 123, 122])] {
+                let colors = Colors::new(theme);
+                for mask in [CHECKER, VERTICAL, HORIZONTAL, !CHECKER] {
+                    let mut faces = Vec::new();
+                    coarse_faces(
+                        &view,
+                        ORIGIN,
+                        mask,
+                        colors.white,
+                        colors.black,
+                        |face, ink| {
+                            faces.push((face, ink));
+                        },
+                    );
+                    assert_eq!(faces, [(view.footprint(ORIGIN, 0.0), expected)]);
+                }
+                let mut faces = Vec::new();
+                coarse_faces(&view, ORIGIN, 1, colors.white, colors.black, |_, ink| {
+                    faces.push(ink)
+                });
+                assert_eq!(faces, [mix(colors.white, colors.black, 1.0 / 64.0)]);
+            }
+        }
+    }
+
+    #[test]
+    fn subpixel_pan_keeps_coverage_without_resampling_the_mask() {
+        let sample = |pan_px| {
+            let mut view = view_at(0.09);
+            view.camera.center[0].offset -= pan_px / view.camera.scale;
+            let mut faces = Vec::new();
+            coarse_faces(&view, ORIGIN, CHECKER, [255; 3], [0; 3], |face, ink| {
+                faces.push((face, ink));
+            });
+            let [(face, [128, 128, 128])] = faces.as_slice() else {
+                panic!("unresolved mask was not rendered as one area tone");
+            };
+            // Integrate the same rectangular pixel coverage used by Painter.
+            let overlap = |start: f64, end: f64, px: i32| {
+                (end.min(f64::from(px + 1)) - start.max(f64::from(px))).max(0.0)
+            };
+            let x: f64 = (319..=321)
+                .map(|px| overlap(face.left, face.left + face.w, px))
+                .sum();
+            let y: f64 = (319..=321)
+                .map(|px| overlap(face.top, face.top + face.h, px))
+                .sum();
+            x * y
+        };
+        let first = sample(0.0);
+        assert!(first > 0.5);
+        for pan_px in [0.001, 0.125, 0.5] {
+            assert!((sample(pan_px) - first).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn coarse_tone_and_footprint_transition_smoothly_to_readable_tiles() {
+        let sample = |face_px| {
+            let view = view_at(face_px);
+            let mut min = 255u8;
+            let mut max = 0u8;
+            let mut span = 0.0f64;
+            let [left, _] = view.origin(ORIGIN);
+            coarse_faces(&view, ORIGIN, VERTICAL, [255; 3], [0; 3], |face, ink| {
+                min = min.min(ink[0]);
+                max = max.max(ink[0]);
+                span = span.max((face.left + face.w - left) / view.px);
+            });
+            (min, max, span)
+        };
+        let (min, max, span) = sample(1.0);
+        assert_eq!(min, max);
+        assert!((span - FOOTPRINT).abs() < 1e-9);
+        let (min, max, span) = sample(1.0 + 1e-6);
+        assert!(max - min <= 1); // An RGB8 round at the half-channel tone.
+        assert!((span - FOOTPRINT).abs() < 1e-9);
+        let (min, max, span) = sample(1.5);
+        assert_eq!((min, max), (64, 191));
+        assert!((span - (FOOTPRINT + 8.0 * STEP) * 0.5).abs() < 1e-9);
+        let (min, max, span) = sample(2.0 - 1e-6);
+        assert_eq!((min, max), (0, 255));
+        assert!((span - 8.0 * STEP).abs() < 1e-9);
+        for face_px in [2.0, 3.99] {
+            let (min, max, span) = sample(face_px);
+            assert_eq!((min, max), (0, 255));
+            assert!((span - 8.0 * STEP).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn coarse_runs_merge_in_both_axes_and_only_cover_the_visible_mask() {
+        let mut cells = view_at(2.0).cells(ORIGIN, true, 0.0);
+        for mask in [VERTICAL, HORIZONTAL] {
+            let mut count = 0;
+            cells.coarse_runs(mask, |_, _| count += 1);
+            assert_eq!(count, 2);
+        }
+        cells.cols = 1..7;
+        cells.rows = 2..5;
+        for mask in [CHECKER, VERTICAL, HORIZONTAL, 0xf80c_06fc_f8f0_60e0] {
+            let mut seen = 0u64;
+            cells.coarse_runs(mask, |rect, black| {
+                let x = ((rect.left - cells.origin[0]) / cells.stride).round() as u8;
+                let y = ((rect.top - cells.origin[1]) / cells.stride).round() as u8;
+                let w = (rect.w / cells.stride).round() as u8;
+                let h = (rect.h / cells.stride).round() as u8;
+                for row in y..y + h {
+                    for col in x..x + w {
+                        assert!(cells.cols.contains(&col) && cells.rows.contains(&row));
+                        let bit = 1 << (row * 8 + col);
+                        assert_eq!(seen & bit, 0);
+                        assert_eq!(mask & bit != 0, black);
+                        seen |= bit;
+                    }
+                }
+            });
+            assert_eq!(seen, 0x0000_007e_7e7e_0000);
+        }
     }
 
     #[test]
@@ -1278,6 +1590,26 @@ mod tests {
         assert_eq!(outlines(4.0).len(), 64);
         assert!(outlines(9.99).iter().all(|r| r.radius == 0.0));
         assert!(outlines(10.0).iter().all(|r| r.radius > 0.0));
+    }
+
+    #[test]
+    fn crowded_preview_and_radial_strokes_leave_room_for_the_physical_filter() {
+        let near = view_at(4.0);
+        let gap = (STEP - FACE) * near.px;
+        let cells = near.cells(ORIGIN, false, 0.0);
+        let (left, width) = cells.face(0, 0).separated_outline(1.0, gap);
+        let (right, _) = cells.face(1, 0).separated_outline(1.0, gap);
+        assert_eq!(width, 1.0);
+        assert!((right.left - (left.left + left.w) - width - 1.0).abs() < 1e-9);
+        let regular = view_at(28.0);
+        let face = regular.cells(ORIGIN, false, 0.0).face(0, 0);
+        assert_eq!(
+            face.separated_outline(1.0, (STEP - FACE) * regular.px),
+            (face, 1.0)
+        );
+        assert_eq!(ring_detail(0.0, 1.6, 1.0), 0.0);
+        assert_eq!(ring_detail(1.15, 1.6, 1.0), 0.5);
+        assert_eq!(ring_detail(-2.3, 1.6, 1.0), 1.0);
     }
 
     #[test]

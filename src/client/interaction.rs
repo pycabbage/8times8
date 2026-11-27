@@ -18,12 +18,13 @@ use super::{
     View, WORLD_STEP,
     audio::Audio,
     board::{self, Effects},
-    hud::{self, Action, DebugAction, Hud, MachineRow, MachineTier},
-    legacy,
+    hud::{self, Action, Hud, MachineRow, MachineTier},
     machines::{MACHINE_PRICE, MACHINES_PER_TIER, Machines},
     save::{self, Saved},
     screen_center,
 };
+#[cfg(debug_assertions)]
+use super::{hud::DebugAction, legacy};
 
 const FRAME_TIME: Duration = Duration::from_nanos(16_666_667);
 const SAVE_DELAY: Duration = Duration::from_millis(400);
@@ -34,6 +35,11 @@ const TOOLTIP_DELAY: Duration = Duration::from_millis(700);
 const HINT_DELAY: Duration = Duration::from_millis(700);
 const HINT_DURATION: Duration = Duration::from_secs(12);
 const ZOOM_FACTOR: f64 = 1.4;
+const WHEEL_ZOOM_FACTOR: f64 = 1.20;
+const WHEEL_LINE_PIXELS: f64 = 16.0;
+const WHEEL_PIXEL_CAP: f64 = 200.0;
+const PIXEL_ZOOM_COEFFICIENT: f64 = 0.0018;
+const FAST_PIXEL_ZOOM_COEFFICIENT: f64 = 0.01;
 const HUD_INSTANCE_RESERVE: usize = 32 * 1024;
 const ANIMATION_BUDGET: usize = 1500;
 
@@ -125,9 +131,13 @@ pub(super) struct Play {
     hint_at: Option<Instant>,
     saves: Option<SaveWorker>,
     _save_session: save::SaveSession,
+    #[cfg(debug_assertions)]
     clipboard: Option<arboard::Clipboard>,
+    #[cfg(debug_assertions)]
     debug_pending: Option<DebugAction>,
+    #[cfg(debug_assertions)]
     machine_paused: bool,
+    #[cfg(debug_assertions)]
     machine_speed: u32,
     save_at: Option<Instant>,
     retry_at: Option<Instant>,
@@ -211,9 +221,13 @@ impl Play {
             hint_at: (!hint_seen).then_some(now + HINT_DELAY),
             saves,
             _save_session: save_session,
+            #[cfg(debug_assertions)]
             clipboard: None,
+            #[cfg(debug_assertions)]
             debug_pending: None,
+            #[cfg(debug_assertions)]
             machine_paused: false,
+            #[cfg(debug_assertions)]
             machine_speed: 1,
             save_at: None,
             retry_at: None,
@@ -371,11 +385,12 @@ impl Play {
                                 self.window.request_redraw();
                             }
                             KeyCode::Escape if !event.repeat => {
+                                #[cfg(debug_assertions)]
                                 if self.debug_pending.is_some() {
                                     self.action(Action::DebugCancel, view, now);
-                                } else {
-                                    event_loop.exit();
+                                    return Ok(());
                                 }
+                                event_loop.exit();
                             }
                             KeyCode::Home if !event.repeat => self.action(Action::Home, view, now),
                             KeyCode::KeyU if !event.repeat => {
@@ -402,11 +417,11 @@ impl Play {
     }
 
     fn tooltip_target(&self, view: View) -> Option<Action> {
-        if self.space
-            || self.mouse_button.is_some()
-            || self.debug_pending.is_some()
-            || self.gesture != Gesture::Idle
-        {
+        #[cfg(debug_assertions)]
+        if self.debug_pending.is_some() {
+            return None;
+        }
+        if self.space || self.mouse_button.is_some() || self.gesture != Gesture::Idle {
             return None;
         }
         self.hud.tooltip_action(view.size, view.dpi, self.cursor?)
@@ -667,10 +682,7 @@ impl Play {
     }
 
     fn wheel(&mut self, view: View, delta: MouseScrollDelta, now: Instant) {
-        let y = match delta {
-            MouseScrollDelta::LineDelta(_, y) => f64::from(y) * 16.0,
-            MouseScrollDelta::PixelDelta(p) => p.y / view.dpi,
-        };
+        let y = logical_wheel_y(delta, view.dpi);
         let pos = self.cursor.unwrap_or_else(|| screen_center(view.size));
         if self.hud.scroll(view.size, view.dpi, pos, y) {
             self.window.request_redraw();
@@ -680,16 +692,12 @@ impl Play {
             return;
         }
         self.advance_camera(now);
-        let coefficient = if self.modifiers.control_key() {
-            0.01
-        } else {
-            0.0018
-        };
         let goal_scale = self
             .tween
             .take()
             .map_or(self.camera.scale, |tween| tween.to.scale);
-        let factor = (y.clamp(-200.0, 200.0) * coefficient).exp() * goal_scale / self.camera.scale;
+        let factor = wheel_zoom_factor(delta, view.dpi, self.modifiers.control_key()) * goal_scale
+            / self.camera.scale;
         if self.camera.zoom_at(view, pos, factor) {
             self.camera_changed(now);
         }
@@ -741,6 +749,7 @@ impl Play {
     }
 
     fn action(&mut self, action: Action, view: View, now: Instant) {
+        #[cfg(debug_assertions)]
         if self.debug_pending.is_some()
             && !matches!(action, Action::DebugConfirm | Action::DebugCancel)
         {
@@ -751,10 +760,12 @@ impl Play {
                 self.hud.toggle_shop();
                 false
             }
+            #[cfg(debug_assertions)]
             Action::Debug => {
                 self.hud.toggle_debug();
                 false
             }
+            #[cfg(debug_assertions)]
             Action::DebugCommand(command) => {
                 if matches!(
                     command,
@@ -770,6 +781,7 @@ impl Play {
                 }
                 false
             }
+            #[cfg(debug_assertions)]
             Action::DebugConfirm => {
                 let pending = self.debug_pending.take();
                 self.hud.set_debug_pending(None);
@@ -778,6 +790,7 @@ impl Play {
                 }
                 false
             }
+            #[cfg(debug_assertions)]
             Action::DebugCancel => {
                 self.debug_pending = None;
                 self.hud.set_debug_pending(None);
@@ -831,6 +844,7 @@ impl Play {
         self.window.request_redraw();
     }
 
+    #[cfg(debug_assertions)]
     fn run_debug(&mut self, command: DebugAction, view: View, now: Instant) {
         use DebugAction::*;
         let success = match command {
@@ -918,6 +932,7 @@ impl Play {
             .set_debug_feedback(Some(success.unwrap_or_else(|message| message).into()));
     }
 
+    #[cfg(debug_assertions)]
     fn reset_transient(&mut self) {
         self.machine_paused = false;
         self.machine_speed = 1;
@@ -929,6 +944,7 @@ impl Play {
         self.hud.set_hint(false);
     }
 
+    #[cfg(debug_assertions)]
     fn clipboard(&mut self) -> Result<&mut arboard::Clipboard, &'static str> {
         if self.clipboard.is_none() {
             self.clipboard = Some(arboard::Clipboard::new().map_err(|err| {
@@ -939,6 +955,7 @@ impl Play {
         Ok(self.clipboard.as_mut().expect("clipboard was initialized"))
     }
 
+    #[cfg(debug_assertions)]
     fn copy_save(&mut self) -> Result<&'static str, &'static str> {
         let text = save::to_clipboard(&self.snapshot()).map_err(|err| {
             eprintln!("{NAME}: clipboard encoding failed: {err}");
@@ -951,6 +968,7 @@ impl Play {
         Ok("セーブデータをコピーしました")
     }
 
+    #[cfg(debug_assertions)]
     fn paste_save(&mut self, view: View, now: Instant) -> Result<&'static str, &'static str> {
         if self.saves.is_none() {
             eprintln!("{NAME}: save paste refused because autosave is disabled");
@@ -1250,6 +1268,29 @@ impl Play {
     }
 }
 
+fn logical_wheel_y(delta: MouseScrollDelta, dpi: f64) -> f64 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => f64::from(y) * WHEEL_LINE_PIXELS,
+        MouseScrollDelta::PixelDelta(p) => p.y / dpi,
+    }
+}
+
+fn wheel_zoom_factor(delta: MouseScrollDelta, dpi: f64, control: bool) -> f64 {
+    let y = logical_wheel_y(delta, dpi).clamp(-WHEEL_PIXEL_CAP, WHEEL_PIXEL_CAP);
+    let coefficient = if control {
+        FAST_PIXEL_ZOOM_COEFFICIENT
+    } else {
+        PIXEL_ZOOM_COEFFICIENT
+    };
+    match delta {
+        // Ctrl keeps the same gain in log-zoom space for both kinds of wheel input.
+        MouseScrollDelta::LineDelta(..) => {
+            WHEEL_ZOOM_FACTOR.powf((y / WHEEL_LINE_PIXELS) * (coefficient / PIXEL_ZOOM_COEFFICIENT))
+        }
+        MouseScrollDelta::PixelDelta(_) => (y * coefficient).exp(),
+    }
+}
+
 fn moved(a: [f64; 2], b: [f64; 2], dpi: f64) -> bool {
     (a[0] - b[0]).hypot(a[1] - b[1]) >= DRAG_START * dpi
 }
@@ -1516,6 +1557,83 @@ impl Drop for SaveWorker {
             .is_some_and(|worker| worker.join().is_err())
         {
             eprintln!("{NAME}: autosave worker stopped unexpectedly");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::dpi::PhysicalPosition;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-12 * expected.abs().max(1.0),
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn wheel_notches_multiply_camera_scale_and_reverse_at_the_cursor() {
+        let view = View {
+            size: PhysicalSize::new(800, 600),
+            dpi: 1.0,
+            bounds: [-10, -10, 10, 10],
+        };
+        let pos = [320.0, 210.0];
+        let mut camera = Camera::centered(view);
+        let start = camera.scale;
+        let anchor = camera.world_at(view.size, pos).unwrap();
+        let factor =
+            |notches| wheel_zoom_factor(MouseScrollDelta::LineDelta(0.0, notches), view.dpi, false);
+        let assert_anchor = |camera: Camera| {
+            let current = camera.world_at(view.size, pos).unwrap();
+            for (before, after) in anchor.into_iter().zip(current) {
+                assert_close(before.distance(after), 0.0);
+            }
+        };
+
+        for notches in 1..=4 {
+            assert!(camera.zoom_at(view, pos, factor(1.0)));
+            assert_close(camera.scale, start * 1.2_f64.powi(notches));
+            assert_anchor(camera);
+        }
+        for notches in (0..4).rev() {
+            assert!(camera.zoom_at(view, pos, factor(-1.0)));
+            assert_close(camera.scale, start * 1.2_f64.powi(notches));
+            assert_anchor(camera);
+        }
+        assert_close(factor(4.0), factor(1.0).powi(4));
+        assert_close(factor(-4.0), factor(-1.0).powi(4));
+        assert_close(factor(4.0) * factor(-4.0), 1.0);
+        assert_close(factor(1e6), factor(12.5));
+        assert_close(factor(-1e6), factor(-12.5));
+    }
+
+    #[test]
+    fn wheel_control_preserves_log_gain_for_notches() {
+        let factor =
+            |notches| wheel_zoom_factor(MouseScrollDelta::LineDelta(0.0, notches), 1.0, true);
+        assert_close(factor(1.0), 1.2_f64.powf(0.01 / 0.0018));
+        assert_close(factor(1.0) * factor(-1.0), 1.0);
+    }
+
+    #[test]
+    fn wheel_pixels_keep_continuous_zoom_and_hud_scroll_units() {
+        let dpi = 2.0;
+        let delta = |y| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y));
+        assert_close(
+            logical_wheel_y(MouseScrollDelta::LineDelta(0.0, 1.0), dpi),
+            16.0,
+        );
+        assert_close(logical_wheel_y(delta(2.5), dpi), 1.25);
+
+        for (control, coefficient) in [(false, 0.0018), (true, 0.01)] {
+            let factor = |y| wheel_zoom_factor(delta(y), dpi, control);
+            assert_close(factor(2.5), (1.25_f64 * coefficient).exp());
+            assert_close(factor(2.5).powi(2), factor(5.0));
+            assert_close(factor(2.5) * factor(-2.5), 1.0);
+            assert_close(factor(500.0), (200.0_f64 * coefficient).exp());
         }
     }
 }

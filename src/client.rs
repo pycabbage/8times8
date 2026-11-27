@@ -15,7 +15,9 @@ use self::interaction::Play;
 mod audio;
 mod board;
 mod hud;
+mod icon;
 mod interaction;
+#[cfg(debug_assertions)]
 mod legacy;
 mod machines;
 mod save;
@@ -89,7 +91,7 @@ fn window_attributes() -> WindowAttributes {
     let attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, NAME, NAME);
     #[cfg(target_os = "windows")]
     let attrs = winit::platform::windows::WindowAttributesExtWindows::with_class_name(attrs, NAME);
-    attrs
+    icon::apply(attrs)
 }
 
 impl ApplicationHandler<GpuError> for App {
@@ -353,6 +355,8 @@ fn pixel_delta(size: PhysicalSize<u32>, at: [f64; 2]) -> [f64; 2] {
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 struct Instance {
+    // Independent clip-space left, top, right and bottom. Computing both ends
+    // before narrowing to f32 preserves visible edges of large offscreen shapes.
     rect: [f32; 4],
     color: [f32; 4],
     // Physical width, height, radius and stroke. Negative stroke denotes a diamond.
@@ -425,6 +429,7 @@ impl Painter<'_> {
 
     fn shape(&mut self, area: [f64; 4], radius: f64, stroke: f64, [r, g, b]: [u8; 3]) {
         let [left, top, width, height] = area;
+        let [right, bottom] = [left + width, top + height];
         let [w, h] = [f64::from(self.size.width), f64::from(self.size.height)];
         if self.output.len() >= self.limit
             || w == 0.0
@@ -433,11 +438,11 @@ impl Painter<'_> {
             || height <= 0.0
             || left >= w
             || top >= h
-            || left + width <= 0.0
-            || top + height <= 0.0
+            || right <= 0.0
+            || bottom <= 0.0
             || !area
                 .into_iter()
-                .chain([radius, stroke])
+                .chain([right, bottom, radius, stroke])
                 .all(|n| n.is_finite() && n.abs() < f64::from(f32::MAX))
         {
             return;
@@ -446,8 +451,8 @@ impl Painter<'_> {
             rect: [
                 (left * 2.0 / w - 1.0) as f32,
                 (1.0 - top * 2.0 / h) as f32,
-                (width * 2.0 / w) as f32,
-                (-height * 2.0 / h) as f32,
+                (right * 2.0 / w - 1.0) as f32,
+                (1.0 - bottom * 2.0 / h) as f32,
             ],
             color: [r, g, b, 255].map(|channel| f32::from(channel) / 255.0),
             shape: [
@@ -547,6 +552,8 @@ struct Graphics {
     config: wgpu::SurfaceConfiguration,
     configured: bool,
     pipeline: wgpu::RenderPipeline,
+    viewport: wgpu::Buffer,
+    viewport_group: wgpu::BindGroup,
     buffer: wgpu::Buffer,
     warned_large: bool,
 }
@@ -627,14 +634,34 @@ impl Graphics {
         config.present_mode = wgpu::PresentMode::Fifo;
         let limit = device.limits().max_texture_dimension_2d;
         let configured = (1..=limit).contains(&size.width) && (1..=limit).contains(&size.height);
-        let (pipeline, buffer) = check_gpu(&device, || {
+        let (pipeline, viewport, viewport_group, buffer) = check_gpu(&device, || {
             if configured {
                 config.width = size.width;
                 config.height = size.height;
                 surface.configure(&device, &config);
             }
+            let pipeline = pipeline(&device, config.format);
+            let viewport = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("8times8 clip units per physical pixel"),
+                size: size_of::<[f32; 2]>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            if configured {
+                set_viewport(&queue, &viewport, size);
+            }
+            let viewport_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("8times8 viewport"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: viewport.as_entire_binding(),
+                }],
+            });
             (
-                pipeline(&device, config.format),
+                pipeline,
+                viewport,
+                viewport_group,
                 instance_buffer(&device, 128),
             )
         })
@@ -649,6 +676,8 @@ impl Graphics {
             config,
             configured,
             pipeline,
+            viewport,
+            viewport_group,
             buffer,
             warned_large: false,
         })
@@ -684,6 +713,7 @@ impl Graphics {
                     self.surface.configure(&self.device, &self.config);
                 }))
                 .map_err(|err| format!("could not reconfigure the graphics surface: {err}"))?;
+                set_viewport(&self.queue, &self.viewport, size);
                 self.configured = true;
             }
             use wgpu::CurrentSurfaceTexture::*;
@@ -768,6 +798,7 @@ impl Graphics {
             });
             if !bytes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.viewport_group, &[]);
                 pass.set_vertex_buffer(0, self.buffer.slice(..));
                 pass.draw(0..6, 0..instances.len() as u32);
             }
@@ -776,6 +807,11 @@ impl Graphics {
         window.pre_present_notify();
         self.queue.present(frame);
     }
+}
+
+fn set_viewport(queue: &wgpu::Queue, buffer: &wgpu::Buffer, size: PhysicalSize<u32>) {
+    let pixel = [size.width, size.height].map(|n| 2.0 / n as f32);
+    queue.write_buffer(buffer, 0, bytemuck::bytes_of(&pixel));
 }
 
 fn instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -797,9 +833,10 @@ struct Output {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
     @location(1) @interpolate(flat) shape: vec4<f32>,
-    @location(2) local: vec2<f32>,
+    @location(2) edges: vec4<f32>,
 }
 
+@group(0) @binding(0) var<uniform> pixel: vec2<f32>;
 override target_srgb: bool = false;
 
 @vertex
@@ -813,37 +850,47 @@ fn vertex_main(
         vec2<f32>(0., 0.), vec2<f32>(1., 0.), vec2<f32>(0., 1.),
         vec2<f32>(0., 1.), vec2<f32>(1., 0.), vec2<f32>(1., 1.),
     );
-    let uv = corners[index];
-    return Output(vec4<f32>(rect.xy + uv * rect.zw, 0., 1.), color, shape, (uv - 0.5) * shape.xy);
+    // Rasterize half a physical pixel beyond each edge, regardless of DPI.
+    let pad = vec2(pixel.x, -pixel.y) * 0.5;
+    let start = clamp(rect.xy - pad, vec2(-1.), vec2(1.));
+    let end = clamp(rect.zw + pad, vec2(-1.), vec2(1.));
+    let p = select(start, end, corners[index] == vec2(1.));
+    let edges = vec4(p.x - rect.x, rect.y - p.y, rect.z - p.x, p.y - rect.w) / pixel.xyxy;
+    var rgb = color.rgb;
+    if target_srgb {
+        rgb = select(pow((rgb + 0.055) / 1.055, vec3(2.4)), rgb / 12.92, rgb <= vec3(0.04045));
+    }
+    return Output(vec4(p, 0., 1.), vec4(rgb, color.a), shape, edges);
 }
 
-fn round_span(y: f32, half_size: vec2<f32>, radius: f32) -> f32 {
-    let corner = max(0., abs(y) - (half_size.y - radius));
-    return half_size.x - radius + sqrt(max(0., radius * radius - corner * corner));
+fn box_coverage(edges: vec4<f32>, radius: f32) -> f32 {
+    let near = min(edges.xy, edges.zw);
+    let far = max(edges.xy, edges.zw);
+    // Exact pixel overlap along straight edges, including subpixel-wide shapes.
+    let overlap = max(vec2(0.), min(near + 0.5, vec2(1.)) - max(0.5 - far, vec2(0.)));
+    let area = overlap.x * overlap.y;
+    if area <= 0. || radius <= 0. || any(near >= vec2(radius)) {
+        return area;
+    }
+    let distance = length(vec2(radius) - near) - radius;
+    return min(area, clamp(0.5 - distance, 0., 1.));
 }
 
 @fragment
 fn fragment_main(input: Output) -> @location(0) vec4<f32> {
-    let half_size = input.shape.xy * 0.5;
     let radius = input.shape.z;
     let stroke = input.shape.w;
-    let x = abs(input.local.x);
-    let y = abs(input.local.y);
+    var coverage = box_coverage(input.edges, radius);
     if stroke < 0. {
-        if x > half_size.x * (1. - y / half_size.y) { discard; }
-    } else {
-        if radius > 0. && x > round_span(y, half_size, radius) { discard; }
-        if stroke > 0. {
-            let inner = half_size - stroke;
-            if y < inner.y && x < round_span(y, inner, max(0., radius - stroke)) { discard; }
-        }
+        let near = min(input.edges.xy, input.edges.zw);
+        let distance = (input.shape.x * 0.5 - near.x - near.y) * 0.70710678118;
+        coverage = min(coverage, clamp(0.5 - distance, 0., 1.));
+    } else if stroke > 0. && coverage > 0. {
+        coverage -= box_coverage(input.edges - stroke, max(0., radius - stroke));
     }
-    if target_srgb {
-        let s = input.color.rgb;
-        let linear = select(pow((s + 0.055) / 1.055, vec3(2.4)), s / 12.92, s <= vec3(0.04045));
-        return vec4(linear, input.color.a);
-    }
-    return input.color;
+    // Completely empty pixels (e.g. the middle of a giant frame) need not blend.
+    if coverage <= 0. { discard; }
+    return vec4(input.color.rgb, input.color.a * coverage);
 }
 "#
             .into(),
@@ -855,7 +902,10 @@ fn fragment_main(input: Output) -> @location(0) vec4<f32> {
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vertex_main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("target_srgb", if format.is_srgb() { 1.0 } else { 0.0 })],
+                ..Default::default()
+            },
             buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: size_of::<Instance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
@@ -868,13 +918,10 @@ fn fragment_main(input: Output) -> @location(0) vec4<f32> {
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fragment_main"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[("target_srgb", if format.is_srgb() { 1.0 } else { 0.0 })],
-                ..Default::default()
-            },
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: None,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -965,5 +1012,26 @@ mod tests {
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].shape, [20.0, 10.0, 5.0, 0.0]);
         assert_eq!(instances[1].shape, [12.0, 12.0, 5.0, 2.0]);
+    }
+
+    #[test]
+    fn painter_keeps_visible_edges_of_far_offscreen_shapes() {
+        let mut instances = Vec::new();
+        let mut p = Painter {
+            output: &mut instances,
+            size: PhysicalSize::new(8192, 2048),
+            limit: 1,
+        };
+        let offset = (1_u64 << 34) as f64;
+        p.rect(
+            -offset,
+            -offset,
+            offset + 3.25,
+            offset + 6.5,
+            [251, 251, 249],
+        );
+        let [_, _, right, bottom] = instances[0].rect;
+        assert_eq!((right + 1.0) * 4096.0, 3.25);
+        assert_eq!((1.0 - bottom) * 1024.0, 6.5);
     }
 }
