@@ -1,0 +1,14 @@
+version: 2
+project_name: eight-times-eight
+
+builds:
+  - builder: rust
+    binary: eight-times-eight
+    tool: cargo
+    command: build
+    targets: [x86_64-unknown-linux-gnu]
+    flags: [--release, --locked]
+
+archives:
+  - formats: [tar.gz]
+    files: [README.md]
