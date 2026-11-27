@@ -1,7 +1,19 @@
 [package]
-name = "eight-times-eight"
-version = "0.1.1"
+name = "_8times8"
+version = "0.2.0"
 edition = "2024"
 
+[[bin]]
+name = "8times8"
+path = "src/main.rs"
+
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
 num-bigint = "0.5.1"
+pollster = { version = "0.4" }
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
+
+[target."cfg(windows)".dependencies]
+softbuffer = { version = "0.4.8", default-features = false }
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_System_LibraryLoader"] }

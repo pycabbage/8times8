@@ -1,16 +1,16 @@
-# 8 times 8 — Rust リライトの技術選定
+# 8times8 — Rust リライトの技術選定
 
 ## 結論
 
-**ゲームの状態とルールは純 Rust に集約する。盤面は固定幅整数と疎な 8×8 階層、経済値はレベルごとの厳密な非負整数とする。** 経済値の初期候補は `u128` から `num-bigint::BigUint` への昇格方式。Linux x86-64 GNU でまず描画・保存なしのコアを検証し、その後 `winit` + `wgpu` でネイティブデスクトップ版を新規実装し、Vulkan を実機で測る。Windows は後続の配布候補、Web 版は初期開発・配布の対象外とする。
+**ゲームの状態とルールは純 Rust に集約する。盤面は固定幅整数と疎な 8×8 階層、経済値はレベルごとの厳密な非負整数とする。** 経済値の初期候補は `u128` から `num-bigint::BigUint` への昇格方式。Linux x86-64 GNU でゲームコアを単体検証し、`winit` + `wgpu` でネイティブデスクトップ版を新規実装して Vulkan を実機で測る。配布対象は Linux と Windows の x86-64 GNU、Web 版は初期開発・配布の対象外とする。
 
 性能上の優先順位は、**全体走査・境界の反復を減らす → 描画・保存・UI への転送量を抑える → プロファイルに基づき多倍長バックエンドを詰める**。原版（`vendor/`、`cfec14a`）の観察と候補の一次資料に基づく方針であり、候補の性能順位ではない。原版の限定的な実測、静的な見積もり、採否の数値目標は区別する。
 
 ## 原版と配布対象
 
-- 『8 times 8』は白タイルを裏返し、完成した区画を起点に盤面を広げるゲーム。1A は 64 枚、1B 以降は直下レベルの 64 区画で、最高レベルは 1H。1D・1F・1H 到達で、新規開放時の大タイル候補の上限がそれぞれ 1B・1D・1F に上がる。既に開放・完成した領域がある場合は、未使用の小さい候補か通常の 1A に戻る。完成報酬・残高・支出はレベルごとに独立し、レベル間では換算しない。手動強化と、A〜E の自動機械（通常は各 4 台まで）がある。根拠：[盤面・状態](../../vendor/main.js#L41-L68)、[大タイル候補](../../vendor/main.js#L186-L225)、[報酬](../../vendor/main.js#L339-L384)、[ポイント計算](../../vendor/main.js#L99-L103)、[機械の購入](../../vendor/main.js#L1677-L1698)。
+- 『8times8』は白タイルを裏返し、完成した区画を起点に盤面を広げるゲーム。1A は 64 枚、1B 以降は直下レベルの 64 区画で、最高レベルは 1H。1D・1F・1H 到達で、新規開放時の大タイル候補の上限がそれぞれ 1B・1D・1F に上がる。既に開放・完成した領域がある場合は、未使用の小さい候補か通常の 1A に戻る。完成報酬・残高・支出はレベルごとに独立し、レベル間では換算しない。手動強化と、A〜E の自動機械（通常は各 4 台まで）がある。根拠：[盤面・状態](../../vendor/main.js#L41-L68)、[大タイル候補](../../vendor/main.js#L186-L225)、[報酬](../../vendor/main.js#L339-L384)、[ポイント計算](../../vendor/main.js#L99-L103)、[機械の購入](../../vendor/main.js#L1677-L1698)。
 - `vendor/` はルール・動作の参照、差分試験、ベースライン計測にだけ使う。ソース（HTML/CSS/JS、Canvas 2D、Electron ラッパーを含む）、画像・アイコン・音などの資産は再利用も同梱もしない。UI・描画・素材・音は新規に作り、原版の見た目・演出やファイル構成は製品要件にしない。旧セーブの移行も初期要件ではない。
-- 初期のビルド・計測対象は Linux x86-64 GNU（`x86_64-unknown-linux-gnu`）、正式 CI は GitHub Actions の Linux runner とする。Linux の対応環境、Windows 配布の可否、必要になった場合の Web の条件は後述する。
+- 主な計測環境は Linux x86-64 GNU（`x86_64-unknown-linux-gnu`）、正式 CI は GitHub Actions の Linux runner とする。Linux・Windows の配布と実機検証、必要になった場合の Web の条件は後述する。
 
 ## 数値の分離と互換性
 
@@ -63,7 +63,7 @@
 
 | 層 | 選定 |
 | --- | --- |
-| `core` | Rust stable。盤面・経済・購入・アイテム・期限順の機械スケジュールを保持する。headless 入力は操作列、論理位置、時計、乱数などに限る。カメラに由来する機械の初期位置も論理座標の引数で渡し、コアからカメラを参照しない。UI・OS・GPU・音声・保存には依存しない。 |
+| `core` | Rust stable。盤面・経済・購入・アイテム・期限順の機械スケジュールを保持する。コアへの入力は操作列、論理位置、時計、乱数などに限る。カメラに由来する機械の初期位置も論理座標の引数で渡し、コアからカメラを参照しない。UI・OS・GPU・音声・保存には依存しない。 |
 | ネイティブ | [`winit`][winit] のイベントループと [`wgpu`][wgpu] の少数パスによるインスタンス描画。盤面と演出を新規に描画し、HUD・ショップ・デバッグは [`egui-winit` / `egui-wgpu`][egui] で新規実装する。変更のないときは再描画を要求しない。日本語フォントは [Noto Sans CJK JP の OFL][noto] と起動時読込量を確認する。効果音は [`cpal`][cpal] に上限付きの発音イベントを渡して新規に合成し、音声コールバックで盤面ロックや動的確保をしない。 |
 | 新規保存形式 | 型を固定した DTO と [`serde` + `postcard`][postcard] のバイナリを候補とする。版番号、長さ、世代、破損検出を付ける。整数は固定幅または正規化した長さ付き unsigned バイト列（順序を仕様化）とし、Rust の `usize` やライブラリー内部表現は保存に出さない。 |
 | 永続化 | ユーザーデータ領域に単一書き手で保存する。I/O スレッドで同じディレクトリの一時ファイルに保存・同期し、OS 上で検証した置換処理を使う。直前の健全な世代を保持し、失敗・容量不足は通知する。 |
@@ -76,10 +76,10 @@
 
 ### ビルド・配布
 
-- **初期 CI は headless のみ。** [GitHub Actions の `ubuntu-24.04`][github-runners] で、PR ごとに format・Clippy・headless テスト・`x86_64-unknown-linux-gnu` の release ビルドを行う。この段階では UI／GPU／音声／保存をビルド依存に含めない。Rust ツールチェーンと `Cargo.lock` を固定し、ビルド・テストで `--locked` を使う。
-- **製品の配布は Linux runner の GoReleaser を使う。** [組み込み Rust builder][goreleaser-rust] のある OSS v2.20.3 を固定し、`builder: rust`、`tool: cargo`、`command: build`、`targets: [x86_64-unknown-linux-gnu]`、`flags: [--release, --locked]` で通常の Cargo ビルドを行う。[既定の zigbuild と成果物パス][goreleaser-rust-source]に注意し、標準の `target` ディレクトリーと `release` プロファイルを使い、`binary` は実行ファイル名 `eight-times-eight` と一致させる。将来 Cargo workspace にする場合のみ、必要に応じて `--package=<名前>` を flags に足す。v2.20.3 の `healthcheck` は Zig を要求し得るが、通常の Cargo ビルドを使う `release` には不要なので初期 CI のゲートにしない。Pro の prebuilt builder は使わない。製品ビルドが整ってから [`goreleaser release --snapshot --clean`][goreleaser-snapshot] で未公開の配布候補を作る。[正式 SemVer タグの公開ジョブ][goreleaser-actions]は履歴を全取得し、そのジョブのみに `contents: write` と `GITHUB_TOKEN` を渡す。配布は `tar.gz` と SHA256 チェックサム、`vendor/` は同梱しない。設計確定の段階ではタグ発行・公開を行わない。
+- **リリース CI は `v*` タグの push 時に起動する。** [GitHub Actions の `ubuntu-24.04`][github-runners] で `cargo fmt --check`、`cargo clippy --locked --release --all-targets -- -D warnings`、`cargo test --locked --release` を実行する。Rust ツールチェーンと `Cargo.lock` を固定する。
+- **製品の配布は Linux runner の GoReleaser を使う。** GoReleaser v2.20.3 の[組み込み Rust builder][goreleaser-rust] で `cargo build --release --locked` を行う。`project_name` と `binary` は `8times8` とし、Linux x86-64 GNU を `tar.gz`、Windows x86-64 GNU を ZIP で、SHA-256 チェックサムとともに GitHub Releases に公開する。`vendor/` は同梱しない。
 - **正式公開前に ABI と実機を検証する。** CI 成功だけで GPU 対応としない。最低対応環境を決め、古い ABI が必要なら対応下限のコンテナー／sysroot で依存も含めてビルドする。`readelf -V` で GLIBC／GLIBCXX の要求を調べ、ウィンドウ、音声、Vulkan ローダー／ドライバーの依存も確認する。`cpal` 採用時の Linux ビルドには ALSA 開発パッケージを入れる。最低想定環境で配布候補を展開・起動し、Linux 実機で Vulkan の描画・提示・性能を確認してから正式配布する。
-- **Windows は後続候補。** Linux 上で MinGW-w64 の版を固定し、[`x86_64-pc-windows-gnu`][rust-win-gnu] を `cargo build --locked --release` でクロスビルドする。`cargo check` はリンク検証の代用にしない。MSVC は対象外で、[`wgpu` v30 の静的 DXC][wgpu-dxc]は使わない。Vulkan を初回候補とし、DX12 は FXC／動的 DXC を別に検証する。依存 DLL を調べ、実 Windows 上で配布候補の展開・起動・描画・入力と性能を確認するまで配布しない。
+- **Windows 向けも実機で検証する。** Linux 上で MinGW-w64 を使い、[`x86_64-pc-windows-gnu`][rust-win-gnu] を `cargo build --locked --release` でクロスビルドする。`cargo check` はリンク検証の代用にしない。MSVC は対象外で、[`wgpu` v30 の静的 DXC][wgpu-dxc]は使わない。Vulkan を初回候補とし、DX12 は FXC／動的 DXC を別に検証する。依存 DLL を調べ、Windows 実機で配布候補の展開・起動・描画・入力と性能を確認する。
 
 ### Web を作る場合の条件（初期対象外）
 
@@ -94,7 +94,7 @@
 
 #### ロード時の境界再構成
 
-`cfec14a` の [`load()` と補助関数](../../vendor/main.js#L686-L744) を計時用ページに挙動を変えず抽出し、Linux x86-64（Ryzen 9 9950X）、ヘッドレス Chrome 157.0.8103.78 で実行した。別プロセス・別プロファイルで 2 回、各ケースで毎試行盤面を作り直し、16 回ウォームアップ後に 40 回計測した。`localStorage` の `8times8.v1` に原点の完成区画一つ・機械なしの合成 v2 を置く。`done` は 1D で `{"4":["0,0"]}`、1E で `{"5":["0,0"]}`、いずれもアイテム取得済み、`groups`／`coarse` は空、入力は各 238 B。
+`cfec14a` の [`load()` と補助関数](../../vendor/main.js#L686-L744) を計時用ページに挙動を変えず抽出し、Linux x86-64（Ryzen 9 9950X）、Chrome 157.0.8103.78 で実行した。別プロセス・別プロファイルで 2 回、各ケースで毎試行盤面を作り直し、16 回ウォームアップ後に 40 回計測した。`localStorage` の `8times8.v1` に原点の完成区画一つ・機械なしの合成 v2 を置く。`done` は 1D で `{"4":["0,0"]}`、1E で `{"5":["0,0"]}`、いずれもアイテム取得済み、`groups`／`coarse` は空、入力は各 238 B。
 
 | ケース | `touch` 呼び出し（別試行で計数） | p50（第1回／第2回） | p95（第1回／第2回） |
 | --- | ---: | ---: | ---: |
@@ -103,21 +103,15 @@
 
 原版 `saveNow()` が `groups`／`coarse` を出力した 1E の往復入力でも `touch` は 16,384 回、p50 は 29.403／26.745 ms。計時はキャッシュ済み `localStorage` の読み取り・JSON 解析・盤面再構成を含む同期 `load()` 区間のみ。保存書き込み・描画・起動は含まない。同サイズの合成入力でも辺が伸びると反復が増えることを確認したが、1F／1H は実行しておらず、Rust や Electron の性能との比較には使わない。
 
-#### 初期 1A の単発描画トレース
-
-ソース・資産を変更せず、`cfec14a` の `vendor/index.html` を Chrome 157.0.8103.78 のヘッドレスで起動した。1280×820 / DPR 1、ライトテーマ・効果音オフ、新規プロファイル、進捗セーブ・機械なし。初期 1A のタイル 27（0 起点）を左クリック 1 回し、反転が 0→1 枚になることを確認した。
-
-再現時は、初期描画後に Chrome の [CDP `Tracing`][chrome-tracing] で `devtools.timeline` を取り、[原版のテスト用 `tileCenterScreen`](../../vendor/main.js#L2342-L2354) でタイル中央を求めてクリックする。クリックに続く描画用 rAF の [コールバック `frame()`](../../vendor/main.js#L812-L845) を `FunctionCall` から抽出する。12 回の経過時間（`dur`）は中央値 **0.326 ms**（0.228–0.529 ms）、同区間のスレッド CPU 時間（`tdur`）は中央値 **0.325 ms**、同コールバックの開始間隔（`ts` の隣接差）は中央値 **16.67 ms**。これは表示 FPS や GPU 時間ではない。単発の初期盤面だけなので、高負荷、Electron 実機、プロセス全体の CPU・RSS は未計測であり、原版全体やリライト後の性能には外挿しない。
-
 ### 実装時の検証
 
-**疎な境界・空間索引の headless 採用ゲート。** 描画や保存層に進む前に、1D／1F／1H と小規模盤面・密な盤面で同一の可視領域を使う。疎な系列は非ゼロノード数を揃えて深さの影響を切り分け、区画の整列境界、負座標、辺の一部分だけの照会、境界の部分消費後の再照会を含める。
+**疎な境界・空間索引の構造比較。** ゲームコアの検証では、1D／1F／1H と小規模盤面・密な盤面で同一の可視領域を使う。疎な系列は非ゼロノード数を揃えて深さの影響を切り分け、区画の整列境界、負座標、辺の一部分だけの照会、境界の部分消費後の再照会を含める。
 
 小規模では `vendor/` を正しさの基準とし、意図的な差異を除いた論理状態・出力順を完全照合する。合成盤面では 1B `(3,0)` 完成時に東辺の 1A `(28,0)` は未開放。後の 1C `(1,1)` 完成で進入可能になっても古い接触分の開放は増えず、照会順を逆にしても一致することを試す。1H など原版展開が現実的でないケースは実行せず、独立した座標・報酬の式と局所を素朴に展開する参照実装で確かめる。
 
-固定した Linux 実機の headless release で、物理レコードの事前展開／遅延展開、直接走査／索引を片方ずつ切り替える。準備と変更・完了・境界の部分消費・可視照会・競合最近傍を分け、結果 0 件も含めて訪問ノード・生成／解放レコードを数える。解放・回収のコストを含めた各操作の p95 とピーク RSS（常駐分と操作中の追加分）を事前予算と比較する。出力件数固定で辺長と視野外ノード総数を別々に増やし、境界処理・照会のコストがいずれにも比例しないこと、断片が多い盤面で予算内、小盤面で非退行を採用条件とする。
+固定した Linux 実機で最適化を有効にした構造ベンチマークを行い、物理レコードの事前展開／遅延展開、直接走査／索引を片方ずつ切り替える。準備と変更・完了・境界の部分消費・可視照会・競合最近傍を分け、結果 0 件も含めて訪問ノード・生成／解放レコードを数える。解放・回収のコストを含めた各操作の p95 とピーク RSS（常駐分と操作中の追加分）を事前予算と比較する。出力件数固定で辺長と視野外ノード総数を別々に増やし、境界処理・照会のコストがいずれにも比例しないこと、断片が多い盤面で予算内、小盤面で非退行を採用条件とする。
 
-1. **基準を取る。** Linux x86-64 GNU の headless release ビルドで固定入力を繰り返し、次に Linux 実機で Vulkan 描画・保存込みの基準を取る。端末、OS、GPU／ドライバー、ビルド設定、盤面分布・金額のビット長、解像度・DPR・カメラと入力量を記録する。音・ショップはオン／オフを分け、コールド起動とウォーム実行は混ぜない。原版は参照値とし、同条件・同区間で測れたケース以外の速度比は出さない。
+1. **基準を取る。** Linux x86-64 GNU 上でゲームコアに固定入力を繰り返し与えて計測し、次に Linux 実機で Vulkan 描画・保存込みの基準を取る。端末、OS、GPU／ドライバー、ビルド設定、盤面分布・金額のビット長、解像度・DPR・カメラと入力量を記録する。音・ショップはオン／オフを分け、コールド起動とウォーム実行は混ぜない。原版は参照値とし、同条件・同区間で測れたケース以外の速度比は出さない。
 2. **盤面と保存の代表シナリオ。** 初期 1A の連打と 64 枚目、[アイテム直前と 1D 直後の原版の状態](../../vendor/main.js#L1767-L1799)を参考にした合成入力、1D／1F／1H の完成、通常枠の上限まで配置した競合機械の最寄り探索を測る。ネイティブでは近接／全体ズーム、ショップでの購入、ドラッグ、確定世代の保存・ロードを別に測る。原版の参照実行は現実的なケースに限定する。
 3. **論理挙動と厳密性を先に判定する。** 時計・乱数・入力列を固定し、親座標の `-5/-4/3/4` と許容域の端、機械予約・同時刻・移動中の段階変更、群の混在、報酬・開放・アイテム・親連鎖の順を照合する。初期盤面でタイル 27 から予算 128 を使う回帰例では、1A `(0,0)` の次に北 `(0,-1)` が完成する。`2^53±1`、`u128::MAX` 前後、価格の段階 78/79 と 2,581/2,582（次回価格の上限マーカー）、実効作業量の指数 51/52/53、残高＝価格／1 不足、1 ビット広い利用可能額、支出超過の 0 化を独立した厳密整数参照値で確認する。他レベルの残高による購入は不可。新形式では順序を含む往復一致、極端な件数・桁、破損、容量超過時の世代不変、中断・複数起動時の書き手制御と前回成功世代の復元を試す。
 4. **主要指標はプレイ中の待ち時間。** 可視フレームの CPU 準備・GPU・提示間隔、入力から初回反応／操作確定までの時間、完成・探索・ロード・保存の p50/p95/p99、アイドル CPU、ピーク RSS、確保件数、訪問ノード数、描画インスタンス数、スレッド間・GPU 転送量、配布サイズと起動時間を記録する。提案目標は 60 Hz 動作中のフレーム生成時間 p95 ≤ 16.7 ms・p99 ≤ 33.3 ms、入力から初回反応 p95 ≤ 50 ms（意図した演出の待ちは分離計測）。UI を塞がないだけで合格にせず、確定までの時間も比較する。予算・対応機は基準計測後に決める。
@@ -125,9 +119,9 @@
 
 Web を検討する場合は、コード経路の監査と境界のバイト数計測で、Wasm↔JS と Worker↔UI のピクセル転送が素材準備からフレーム提示まで **0 B**、読み戻しもないことを確認する。非ピクセル転送量、UI 更新・入力反応・描画／提示の p95、起動時間・Wasm メモリーを対象の実機で別に測る。`u128` に対応する [Wasm のネイティブ整数型][wasm-number-types]はないため、ブラウザー内で 33〜64／65〜128 ビットと各昇格境界を再計測し、ネイティブでの順位を流用しない。
 
-設計の独立レビューと修正を 2 巡以上行い、承認済みの設計書だけをコミット・プッシュする。それまではコードを追加しない。その後、リポジトリのルートで最初の実装コマンドとして `cargo init --name eight-times-eight --bin --vcs none .` を実行する。`Cargo.toml` は手書きで作成せず、依存の追加には `cargo add` を使う。Git 設定は一切操作しない。
+設計の独立レビューと修正を 2 巡以上行い、承認済みの設計書だけをコミット・プッシュする。それまではコードを追加しない。その後、リポジトリのルートで最初の実装コマンドとして `cargo init --name _8times8 --bin --vcs none .` を実行する。Cargo のパッケージ名は先頭に数字を使えないため `_8times8` とし、生成された `Cargo.toml` の `[[bin]]` に `name = "8times8"` と `path = "src/main.rs"` を指定して実行ファイル名を `8times8` にする。`Cargo.toml` は手書きで作成せず、依存の追加には `cargo add` を使う。Git 設定は一切操作しない。
 
-実装の順番は **再生用データと参照試験 → Linux で厳密整数コア・疎な境界と空間索引の headless 採用ゲート → ネイティブ UI・Vulkan 描画・新規保存 → Linux CI の release ビルドと実機検証 → release タグでの配布**。候補の切替は実測に基づく。Windows は実機検証後の候補、Web 版と旧セーブ移行は初期の順序に含めない。
+実装の順番は **再生用データと参照試験 → Linux で厳密整数コアの単体検証と疎な境界・空間索引の構造比較 → ネイティブ UI・Vulkan 描画・新規保存 → Linux・Windows の実機検証 → タグでの配布**。候補の切替は実測に基づく。Web 版と旧セーブ移行は初期の順序に含めない。
 
 [bnum]: https://docs.rs/bnum/latest/bnum/
 [num-bigint]: https://github.com/rust-num/num-bigint#num-bigint
@@ -145,9 +139,6 @@ Web を検討する場合は、コード経路の監査と境界のバイト数�
 [cpal]: https://github.com/RustAudio/cpal
 [github-runners]: https://docs.github.com/en/actions/reference/runners/github-hosted-runners
 [goreleaser-rust]: https://goreleaser.com/customization/builds/builders/rust/
-[goreleaser-rust-source]: https://github.com/goreleaser/goreleaser/blob/v2.20.3/internal/builders/rust/build.go
-[goreleaser-snapshot]: https://goreleaser.com/customization/publish/snapshots/
-[goreleaser-actions]: https://goreleaser.com/customization/ci/actions/
 [rust-win-gnu]: https://doc.rust-lang.org/rustc/platform-support/windows-gnu.html
 [wgpu-dxc]: https://github.com/gfx-rs/wgpu/blob/v30.0.2/wgpu-hal/build.rs
 [rust-wasm]: https://doc.rust-lang.org/rustc/platform-support/wasm32-unknown-unknown.html
@@ -158,5 +149,4 @@ Web を検討する場合は、コード経路の監査と境界のバイト数�
 [cross-origin-isolated]: https://developer.mozilla.org/en-US/docs/Web/API/Window/crossOriginIsolated
 [webgpu]: https://www.w3.org/TR/webgpu/
 [postcard]: https://postcard.jamesmunns.com/wire-format
-[chrome-tracing]: https://chromedevtools.github.io/devtools-protocol/tot/Tracing/
 [criterion]: https://bheisler.github.io/criterion.rs/book/
