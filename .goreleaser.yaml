@@ -14,4 +14,4 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
-    files: [README.md, LICENSES/Cantarell-OFL-1.1.txt]
+    files: [README.md, LICENSES/Cantarell-OFL-1.1.txt, LICENSES/hud-font-OFL.txt]

@@ -1,26 +1,51 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
-use _8times8::{CellIndex, Game, Level};
+use _8times8::CellIndex;
 use bytemuck::{Pod, Zeroable};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
 };
 
+use self::interaction::Play;
+
+mod audio;
+mod board;
+mod hud;
+mod interaction;
+mod legacy;
+mod machines;
+mod save;
 #[cfg(windows)]
 mod software;
 
 const NAME: &str = "8times8";
 const SIDE: f64 = 8.0;
-const MAX_VISIBLE_TILES_PER_AXIS: f64 = 512.0;
-const MIN_DETAIL_PX: f64 = 6.0;
+const WORLD_STEP: f64 = 253.0 / SIDE;
+const START_OFFSET: f64 = 245.0 / (2.0 * WORLD_STEP);
+const MAX_INSTANCES: usize = 1 << 18;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn system(window: &Window) -> Self {
+        match window.theme() {
+            Some(winit::window::Theme::Dark) => Self::Dark,
+            _ => Self::Light,
+        }
+    }
+
+    fn from_dark(dark: bool) -> Self {
+        if dark { Self::Dark } else { Self::Light }
+    }
+}
 
 pub fn run() -> Result<(), String> {
     let event_loop = EventLoop::with_user_event()
@@ -47,6 +72,9 @@ struct App {
 
 impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: String) {
+        if let Some(play) = &mut self.state {
+            play.flush();
+        }
         self.error = Some(error);
         event_loop.exit();
     }
@@ -55,8 +83,8 @@ impl App {
 fn window_attributes() -> WindowAttributes {
     let attrs = Window::default_attributes()
         .with_title(NAME)
-        .with_inner_size(LogicalSize::new(840, 640))
-        .with_min_inner_size(LogicalSize::new(320, 240));
+        .with_inner_size(LogicalSize::new(1280, 820))
+        .with_min_inner_size(LogicalSize::new(480, 360));
     #[cfg(target_os = "linux")]
     let attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, NAME, NAME);
     #[cfg(target_os = "windows")]
@@ -94,219 +122,34 @@ impl ApplicationHandler<GpuError> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let mut flow = ControlFlow::Wait;
-        if let Some(play) = &mut self.state
-            && let Some(deadline) = play.retry_at
-        {
-            if Instant::now() < deadline {
-                flow = ControlFlow::WaitUntil(deadline);
-            } else {
-                play.retry_at = None;
-                play.window.request_redraw();
-            }
-        }
-        event_loop.set_control_flow(flow);
-    }
-}
-
-struct Play {
-    window: Arc<Window>,
-    renderer: Renderer,
-    game: Game,
-    camera: Camera,
-    cursor: Option<[f64; 2]>,
-    pan_buttons: u8,
-    upgrade_feedback: &'static str,
-    retry_at: Option<Instant>,
-    retries: u8,
-    occluded: bool,
-}
-
-impl Play {
-    fn new(window: Arc<Window>, proxy: EventLoopProxy<GpuError>) -> Result<Self, String> {
-        let renderer = Renderer::new(window.clone(), proxy)?;
-        let camera = Camera::centered(window.inner_size());
-        let play = Self {
-            game: Game::new(),
-            window,
-            renderer,
-            camera,
-            cursor: None,
-            pan_buttons: 0,
-            upgrade_feedback: "",
-            retry_at: None,
-            retries: 0,
-            occluded: false,
-        };
-        play.update_title();
-        play.window.request_redraw();
-        Ok(play)
+        event_loop.set_control_flow(
+            self.state
+                .as_mut()
+                .and_then(Play::idle)
+                .map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
+        );
     }
 
-    fn update_title(&self) {
-        let upgrade = match self.game.next_upgrade() {
-            Some((level, price)) => {
-                format!("{}/{price} 1{level:?}", self.game.available(level))
-            }
-            None => "max".into(),
-        };
-        self.window.set_title(&format!(
-            "{NAME} | 1A cleared: {} | Power: {} | U: {}{upgrade} | Click: flip · Right/mid drag: pan · Wheel: zoom · Home: center",
-            self.game.cleared(Level::A),
-            self.game.manual_power(),
-            self.upgrade_feedback,
-        ));
-    }
-
-    fn on_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) -> Result<(), String> {
-        let size = self.window.inner_size();
-        match event {
-            WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
-            WindowEvent::RedrawRequested => self.redraw(size)?,
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                self.retries = 0;
-                self.retry_at = None;
-                self.camera.fit_size(size);
-                self.window.request_redraw();
-            }
-            WindowEvent::Occluded(hidden) => {
-                self.occluded = hidden;
-                self.retry_at = None;
-                if !hidden {
-                    self.retries = 0;
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let before = self.hover(size);
-                let cursor = [position.x, position.y];
-                let moved = self.pan_buttons != 0
-                    && self.cursor.is_some_and(|old| self.camera.pan(old, cursor));
-                self.cursor = Some(cursor);
-                if moved || before != self.hover(size) {
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
-                self.pan_buttons = 0;
-                if self.cursor.take().is_some() {
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::MouseInput { button, state, .. } => {
-                let mask = match button {
-                    MouseButton::Right => 1,
-                    MouseButton::Middle => 2,
-                    _ => 0,
-                };
-                let before = self.hover(size);
-                if state == ElementState::Pressed {
-                    self.pan_buttons |= mask;
-                    if button == MouseButton::Left
-                        && let Some(hit) = before
-                    {
-                        let cleared = self.game.cleared(Level::A).clone();
-                        if self.game.activate(hit.x, hit.y, hit.cell) {
-                            if !self.upgrade_feedback.is_empty()
-                                || self.game.cleared(Level::A) != &cleared
-                            {
-                                self.upgrade_feedback = "";
-                                self.update_title();
-                            }
-                            self.window.request_redraw();
-                        }
-                    }
-                } else {
-                    self.pan_buttons &= !mask;
-                }
-                if before != self.hover(size) {
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let steps = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-                    MouseScrollDelta::PixelDelta(p) => p.y / 60.0,
-                };
-                let center = [f64::from(size.width) / 2.0, f64::from(size.height) / 2.0];
-                if self.camera.zoom(size, self.cursor.unwrap_or(center), steps) {
-                    self.window.request_redraw();
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !event.repeat =>
-            {
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
-                    PhysicalKey::Code(KeyCode::Home) => {
-                        self.camera = Camera::centered(size);
-                        self.window.request_redraw();
-                    }
-                    PhysicalKey::Code(KeyCode::KeyU) => {
-                        self.upgrade_feedback = if self.game.try_upgrade() {
-                            "bought; next "
-                        } else if self.game.next_upgrade().is_some() {
-                            "unavailable; "
-                        } else {
-                            ""
-                        };
-                        self.update_title();
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(play) = &mut self.state {
+            play.flush();
         }
-        Ok(())
-    }
-
-    fn hover(&self, size: PhysicalSize<u32>) -> Option<Hit> {
-        if self.pan_buttons != 0 {
-            return None;
-        }
-        self.camera.hit(size, self.cursor?)
-    }
-
-    fn redraw(&mut self, size: PhysicalSize<u32>) -> Result<(), String> {
-        self.retry_at = None;
-        if self.occluded || size.width == 0 || size.height == 0 {
-            return Ok(());
-        }
-        self.camera.fit_size(size);
-        let hover = self.hover(size);
-        match self
-            .renderer
-            .draw(&self.window, size, self.camera, &self.game, hover)?
-        {
-            Frame::Presented => self.retries = 0,
-            Frame::Hidden => {}
-            Frame::Retry(reason) => match self.retries {
-                0..=2 => {
-                    self.retries += 1;
-                    self.retry_at = Some(Instant::now() + Duration::from_millis(80));
-                }
-                3 => {
-                    self.retries += 1;
-                    eprintln!(
-                        "{NAME}: display temporarily unavailable ({reason}); will retry on input or resize"
-                    );
-                }
-                _ => {}
-            },
-        }
-        Ok(())
     }
 }
 
 /// Camera coordinates use a signed integer 1A origin and small tile offsets.
 /// Projection and hit testing work relative to this origin, including west and north.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Axis {
     block: i64,
     offset: f64,
 }
 
 impl Axis {
+    fn distance(self, to: Self) -> f64 {
+        (i128::from(to.block) - i128::from(self.block)) as f64 * SIDE + to.offset - self.offset
+    }
+
     fn shifted(self, tiles: f64) -> Option<Self> {
         let tile = self.offset + tiles;
         let delta = (tile / SIDE).floor();
@@ -316,12 +159,12 @@ impl Axis {
         Some(Self {
             block: self.block.checked_add(delta as i64)?,
             // A value immediately west/north of the boundary can round up to 8.
-            offset: (tile - delta * SIDE).min(SIDE.next_down()),
+            offset: (tile - delta * SIDE).clamp(0.0, SIDE.next_down()),
         })
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Camera {
     center: [Axis; 2],
     scale: f64,
@@ -335,38 +178,45 @@ struct Hit {
 }
 
 impl Camera {
-    fn centered(size: PhysicalSize<u32>) -> Self {
+    fn centered(view: View) -> Self {
         Self {
             center: [Axis {
                 block: 0,
-                offset: 4.0,
+                offset: START_OFFSET,
             }; 2],
-            scale: (f64::from(size.width.min(size.height)) * 0.36 / SIDE)
-                .clamp(Self::min_scale(size), Self::max_scale(size)),
+            scale: view.clamp_scale(
+                f64::from(view.size.width.min(view.size.height)) * 0.62 / (2.0 * START_OFFSET),
+            ),
         }
     }
 
-    fn min_scale(size: PhysicalSize<u32>) -> f64 {
-        (f64::from(size.width.max(size.height)) / MAX_VISIBLE_TILES_PER_AXIS).max(1.5)
+    fn constrain(&mut self, view: View) {
+        self.scale = view.clamp_scale(self.scale);
+        for (axis, (low, high)) in self.center.iter_mut().zip(view.extent()) {
+            if low.distance(*axis) < 0.0 {
+                *axis = low;
+            } else if axis.distance(high) < 0.0 {
+                *axis = high;
+            }
+        }
     }
 
-    fn max_scale(size: PhysicalSize<u32>) -> f64 {
-        Self::min_scale(size).max(384.0)
+    fn at_minimum(self, view: View) -> bool {
+        self.scale <= view.min_scale() * 1.0001
     }
 
-    fn fit_size(&mut self, size: PhysicalSize<u32>) {
-        self.scale = self
-            .scale
-            .clamp(Self::min_scale(size), Self::max_scale(size));
+    fn settle(&mut self, view: View) {
+        if self.at_minimum(view) {
+            self.center = view.extent_center();
+        }
     }
 
-    fn pan(&mut self, before: [f64; 2], after: [f64; 2]) -> bool {
+    fn pan(&mut self, view: View, before: [f64; 2], after: [f64; 2]) -> bool {
+        let prior = *self;
         let delta = std::array::from_fn(|i| (before[i] - after[i]) / self.scale);
-        if delta == [0.0, 0.0] {
-            return false;
-        }
         self.translate(delta);
-        true
+        self.constrain(view);
+        *self != prior
     }
 
     fn translate(&mut self, tiles: [f64; 2]) {
@@ -377,49 +227,127 @@ impl Camera {
         }
     }
 
-    fn zoom(&mut self, size: PhysicalSize<u32>, at: [f64; 2], steps: f64) -> bool {
-        if !steps.is_finite() || !at.iter().all(|v| v.is_finite()) {
-            return false;
+    fn zoom_at(&mut self, view: View, at: [f64; 2], factor: f64) -> bool {
+        let prior = *self;
+        if let Some(anchor) = self.world_at(view.size, at) {
+            self.anchor(view, anchor, at, self.scale * factor);
         }
-        let new = (self.scale * 1.2f64.powf(steps.clamp(-8.0, 8.0)))
-            .clamp(Self::min_scale(size), Self::max_scale(size));
-        if new == self.scale {
-            return false;
-        }
-        let delta = pixel_delta(size, at);
-        self.translate(delta.map(|px| px / self.scale - px / new));
-        self.scale = new;
-        true
+        *self != prior
     }
 
-    fn hit(self, size: PhysicalSize<u32>, at: [f64; 2]) -> Option<Hit> {
+    fn anchor(&mut self, view: View, anchor: [Axis; 2], at: [f64; 2], scale: f64) {
+        self.scale = view.clamp_scale(scale);
+        self.center = anchor;
+        self.translate(pixel_delta(view.size, at).map(|p| -p / self.scale));
+        self.constrain(view);
+        self.settle(view);
+    }
+
+    fn world_at(self, size: PhysicalSize<u32>, at: [f64; 2]) -> Option<[Axis; 2]> {
+        let [dx, dy] = pixel_delta(size, at);
+        Some([
+            self.center[0].shifted(dx / self.scale)?,
+            self.center[1].shifted(dy / self.scale)?,
+        ])
+    }
+
+    fn hit_axes(self, size: PhysicalSize<u32>, at: [f64; 2]) -> Option<[Axis; 2]> {
         if !(0.0..f64::from(size.width)).contains(&at[0])
             || !(0.0..f64::from(size.height)).contains(&at[1])
         {
             return None;
         }
-        let [dx, dy] = pixel_delta(size, at);
-        let x = self.center[0].shifted(dx / self.scale)?;
-        let y = self.center[1].shifted(dy / self.scale)?;
-        Some(Hit {
-            x: x.block,
-            y: y.block,
-            cell: CellIndex::from_col_row(x.offset.floor() as u8, y.offset.floor() as u8)?,
-        })
+        self.world_at(size, at)
     }
 
-    fn visible_offsets(self, i: usize, pixels: f64) -> std::ops::RangeInclusive<i64> {
-        let half = pixels / (2.0 * self.scale);
-        let offset = self.center[i].offset;
-        (((offset - half) / SIDE).floor() as i64)..=(((offset + half) / SIDE).ceil() as i64 - 1)
+    fn hit(self, size: PhysicalSize<u32>, at: [f64; 2]) -> Option<Hit> {
+        let [x, y] = self.hit_axes(size, at)?;
+        Hit::from_axes(x, y)
+    }
+
+    fn world_center(self) -> [f64; 2] {
+        self.center
+            .map(|axis| axis.block as f64 * SIDE + axis.offset)
+    }
+
+    fn project(self, size: PhysicalSize<u32>, at: [f64; 2]) -> [f64; 2] {
+        let origin = screen_center(size);
+        let center = self.world_center();
+        std::array::from_fn(|i| origin[i] + (at[i] - center[i]) * self.scale)
     }
 }
 
+impl Hit {
+    fn from_axes(x: Axis, y: Axis) -> Option<Self> {
+        Some(Self {
+            x: x.block,
+            y: y.block,
+            cell: CellIndex::from_col_row(
+                board::cell_at_offset(x.offset)?,
+                board::cell_at_offset(y.offset)?,
+            )?,
+        })
+    }
+}
+
+/// Camera limits are recomputed from the opened region, not a fixed world grid.
+#[derive(Clone, Copy)]
+struct View {
+    size: PhysicalSize<u32>,
+    dpi: f64,
+    bounds: [i64; 4],
+}
+
+impl View {
+    fn extent(self) -> [(Axis, Axis); 2] {
+        std::array::from_fn(|i| {
+            (
+                Axis {
+                    block: self.bounds[i].saturating_sub(1),
+                    offset: 0.0,
+                },
+                Axis {
+                    block: self.bounds[i + 2].saturating_add(1),
+                    offset: 2.0 * START_OFFSET,
+                },
+            )
+        })
+    }
+
+    fn extent_center(self) -> [Axis; 2] {
+        self.extent().map(|(low, high)| {
+            let sum = i128::from(low.block) + i128::from(high.block);
+            let offset = (low.offset + high.offset) * 0.5 + sum.rem_euclid(2) as f64 * SIDE * 0.5;
+            Axis {
+                block: sum.div_euclid(2) as i64,
+                offset,
+            }
+        })
+    }
+
+    fn max_scale(self) -> f64 {
+        4.0 * WORLD_STEP * self.dpi
+    }
+
+    fn min_scale(self) -> f64 {
+        let [(left, right), (top, bottom)] = self.extent();
+        (0.9 * (f64::from(self.size.width.max(1)) / left.distance(right))
+            .min(f64::from(self.size.height.max(1)) / top.distance(bottom)))
+        .min(self.max_scale())
+    }
+
+    fn clamp_scale(self, scale: f64) -> f64 {
+        scale.clamp(self.min_scale(), self.max_scale())
+    }
+}
+
+fn screen_center(size: PhysicalSize<u32>) -> [f64; 2] {
+    [f64::from(size.width) * 0.5, f64::from(size.height) * 0.5]
+}
+
 fn pixel_delta(size: PhysicalSize<u32>, at: [f64; 2]) -> [f64; 2] {
-    [
-        at[0] - f64::from(size.width) / 2.0,
-        at[1] - f64::from(size.height) / 2.0,
-    ]
+    let center = screen_center(size);
+    [at[0] - center[0], at[1] - center[1]]
 }
 
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -427,128 +355,123 @@ fn pixel_delta(size: PhysicalSize<u32>, at: [f64; 2]) -> [f64; 2] {
 struct Instance {
     rect: [f32; 4],
     color: [f32; 4],
+    // Physical width, height, radius and stroke. Negative stroke denotes a diamond.
+    shape: [f32; 4],
 }
 
-struct Palette {
-    background: wgpu::Color,
-    frame: [f32; 4],
-    finished: [f32; 4],
-    white: [f32; 4],
-    ink: [f32; 4],
-    hover: [f32; 4],
-}
-
-impl Palette {
-    fn new(format: wgpu::TextureFormat) -> Self {
-        let color = |rgb: [u8; 3]| {
-            let [r, g, b] = rgb.map(|n| {
-                let s = f32::from(n) / 255.0;
-                if !format.is_srgb() {
-                    s
-                } else if s <= 0.04045 {
-                    s / 12.92
-                } else {
-                    ((s + 0.055) / 1.055).powf(2.4)
-                }
-            });
-            [r, g, b, 1.0]
-        };
-        let [r, g, b, a] = color([18, 25, 38]).map(f64::from);
-        Self {
-            background: wgpu::Color { r, g, b, a },
-            frame: color([70, 88, 111]),
-            finished: color([79, 226, 175]),
-            white: color([245, 249, 255]),
-            ink: color([29, 41, 68]),
-            hover: color([162, 246, 220]),
-        }
-    }
-}
-
-fn board_instances(
-    output: &mut Vec<Instance>,
-    palette: &Palette,
+struct Painter<'a> {
+    output: &'a mut Vec<Instance>,
     size: PhysicalSize<u32>,
-    camera: Camera,
-    game: &Game,
-    hover: Option<Hit>,
-) {
-    output.clear();
-    let [width, height] = [f64::from(size.width), f64::from(size.height)];
-    let tile_px = camera.scale;
-    let detail = tile_px >= MIN_DETAIL_PX;
-    let gap = (tile_px * 0.09).clamp(1.0, 4.0);
-    let board_px = SIDE * tile_px;
-    let mut rect = |left: f64, top: f64, side: f64, color| {
-        if left < width && top < height && left + side > 0.0 && top + side > 0.0 {
-            output.push(Instance {
-                rect: [
-                    (left * 2.0 / width - 1.0) as f32,
-                    (1.0 - top * 2.0 / height) as f32,
-                    (side * 2.0 / width) as f32,
-                    (-side * 2.0 / height) as f32,
-                ],
-                color,
-            });
-        }
-    };
-    for by in camera.visible_offsets(1, height) {
-        let Some(y) = camera.center[1].block.checked_add(by) else {
-            continue;
-        };
-        let top = height * 0.5 + (by as f64 * SIDE - camera.center[1].offset) * tile_px;
-        for bx in camera.visible_offsets(0, width) {
-            let Some(x) = camera.center[0].block.checked_add(bx) else {
-                continue;
-            };
-            let Some(block) = game.block_at(x, y) else {
-                continue;
-            };
-            let left = width * 0.5 + (bx as f64 * SIDE - camera.center[0].offset) * tile_px;
-            let selected = hover.filter(|hit| hit.x == x && hit.y == y);
-            let flipped = block.mask();
-            let complete = flipped == u64::MAX;
-            let edge = if complete {
-                palette.finished
-            } else if !detail && selected.is_some() {
-                palette.hover
-            } else {
-                palette.frame
-            };
-            rect(left + gap * 0.5, top + gap * 0.5, board_px - gap, edge);
-            if detail && !complete {
-                for index in 0..64u8 {
-                    let col = f64::from(index % 8);
-                    let row = f64::from(index / 8);
-                    let color = if flipped & (1 << index) != 0 {
-                        palette.ink
-                    } else if selected.is_some_and(|h| h.cell.index() == index) {
-                        palette.hover
-                    } else {
-                        palette.white
-                    };
-                    rect(
-                        left + col * tile_px + gap,
-                        top + row * tile_px + gap,
-                        tile_px - 2.0 * gap,
-                        color,
-                    );
-                }
-            } else {
-                // Keep completed and zoomed-out blocks in a single progress swatch.
-                let ratio = block.flipped_count() as f32 / 64.0;
-                let color = std::array::from_fn(|i| {
-                    palette.white[i] * (1.0 - ratio) + palette.ink[i] * ratio
-                });
-                rect(
-                    left + gap * 1.5,
-                    top + gap * 1.5,
-                    board_px - 3.0 * gap,
-                    color,
-                );
-            }
-        }
+    limit: usize,
+}
+
+impl Painter<'_> {
+    fn size(&self) -> PhysicalSize<u32> {
+        self.size
     }
+
+    fn rect(&mut self, left: f64, top: f64, width: f64, height: f64, color: [u8; 3]) {
+        self.shape([left, top, width, height], 0.0, 0.0, color);
+    }
+
+    fn rounded(
+        &mut self,
+        left: f64,
+        top: f64,
+        width: f64,
+        height: f64,
+        radius: f64,
+        color: [u8; 3],
+    ) {
+        self.shape([left, top, width, height], radius, 0.0, color);
+    }
+
+    // As with a stroked canvas path, half the stroke grows out from the path and half in.
+    #[allow(clippy::too_many_arguments)]
+    fn outline(
+        &mut self,
+        left: f64,
+        top: f64,
+        width: f64,
+        height: f64,
+        radius: f64,
+        stroke: f64,
+        color: [u8; 3],
+    ) {
+        if width <= 0.0 || height <= 0.0 || stroke <= 0.0 {
+            return;
+        }
+        self.shape(
+            [
+                left - stroke * 0.5,
+                top - stroke * 0.5,
+                width + stroke,
+                height + stroke,
+            ],
+            radius.max(0.0).min(width.min(height) * 0.5) + stroke * 0.5,
+            stroke,
+            color,
+        );
+    }
+
+    fn diamond(&mut self, center: [f64; 2], half: f64, color: [u8; 3]) {
+        self.shape(
+            [center[0] - half, center[1] - half, 2.0 * half, 2.0 * half],
+            0.0,
+            -1.0,
+            color,
+        );
+    }
+
+    fn shape(&mut self, area: [f64; 4], radius: f64, stroke: f64, [r, g, b]: [u8; 3]) {
+        let [left, top, width, height] = area;
+        let [w, h] = [f64::from(self.size.width), f64::from(self.size.height)];
+        if self.output.len() >= self.limit
+            || w == 0.0
+            || h == 0.0
+            || width <= 0.0
+            || height <= 0.0
+            || left >= w
+            || top >= h
+            || left + width <= 0.0
+            || top + height <= 0.0
+            || !area
+                .into_iter()
+                .chain([radius, stroke])
+                .all(|n| n.is_finite() && n.abs() < f64::from(f32::MAX))
+        {
+            return;
+        }
+        self.output.push(Instance {
+            rect: [
+                (left * 2.0 / w - 1.0) as f32,
+                (1.0 - top * 2.0 / h) as f32,
+                (width * 2.0 / w) as f32,
+                (-height * 2.0 / h) as f32,
+            ],
+            color: [r, g, b, 255].map(|channel| f32::from(channel) / 255.0),
+            shape: [
+                width as f32,
+                height as f32,
+                radius.clamp(0.0, width.min(height) * 0.5) as f32,
+                stroke as f32,
+            ],
+        });
+    }
+}
+
+fn clear_color(rgb: [u8; 3], srgb: bool) -> wgpu::Color {
+    let [r, g, b] = rgb.map(|n| {
+        let channel = f64::from(n) / 255.0;
+        if !srgb {
+            channel
+        } else if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    wgpu::Color { r, g, b, a: 1.0 }
 }
 
 enum Frame {
@@ -591,14 +514,13 @@ impl Renderer {
         &mut self,
         window: &Arc<Window>,
         size: PhysicalSize<u32>,
-        camera: Camera,
-        game: &Game,
-        hover: Option<Hit>,
+        background: [u8; 3],
+        instances: &[Instance],
     ) -> Result<Frame, String> {
         match self {
-            Self::Gpu(gpu) => gpu.draw(window, size, camera, game, hover),
+            Self::Gpu(gpu) => gpu.draw(window, size, background, instances),
             #[cfg(windows)]
-            Self::Software(renderer) => renderer.draw(window, size, camera, game, hover),
+            Self::Software(renderer) => renderer.draw(window, size, background, instances),
         }
     }
 }
@@ -626,8 +548,6 @@ struct Graphics {
     configured: bool,
     pipeline: wgpu::RenderPipeline,
     buffer: wgpu::Buffer,
-    palette: Palette,
-    instances: Vec<Instance>,
     warned_large: bool,
 }
 
@@ -720,7 +640,6 @@ impl Graphics {
         })
         .await
         .map_err(|err| format!("could not set up the renderer: {err}"))?;
-        let palette = Palette::new(config.format);
         Ok(Self {
             surface,
             instance,
@@ -731,8 +650,6 @@ impl Graphics {
             configured,
             pipeline,
             buffer,
-            palette,
-            instances: Vec::with_capacity(128),
             warned_large: false,
         })
     }
@@ -741,9 +658,8 @@ impl Graphics {
         &mut self,
         window: &Arc<Window>,
         size: PhysicalSize<u32>,
-        camera: Camera,
-        game: &Game,
-        hover: Option<Hit>,
+        background: [u8; 3],
+        instances: &[Instance],
     ) -> Result<Frame, String> {
         let limit = self.device.limits().max_texture_dimension_2d;
         if size.width > limit || size.height > limit {
@@ -805,24 +721,22 @@ impl Graphics {
                 }
                 Validation => return Err("GPU rejected the current graphics surface".into()),
             };
-            board_instances(
-                &mut self.instances,
-                &self.palette,
-                size,
-                camera,
-                game,
-                hover,
-            );
-            self.present(window, frame);
+            self.present(window, frame, background, instances);
             return Ok(Frame::Presented);
         }
         Ok(Frame::Retry("graphics surface is changing"))
     }
 
-    fn present(&mut self, window: &Window, frame: wgpu::SurfaceTexture) {
-        let bytes = bytemuck::cast_slice(&self.instances);
+    fn present(
+        &mut self,
+        window: &Window,
+        frame: wgpu::SurfaceTexture,
+        background: [u8; 3],
+        instances: &[Instance],
+    ) {
+        let bytes = bytemuck::cast_slice(instances);
         if bytes.len() as u64 > self.buffer.size() {
-            self.buffer = instance_buffer(&self.device, self.instances.len().next_power_of_two());
+            self.buffer = instance_buffer(&self.device, instances.len().next_power_of_two());
         }
         if !bytes.is_empty() {
             self.queue.write_buffer(&self.buffer, 0, bytes);
@@ -843,7 +757,10 @@ impl Graphics {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.palette.background),
+                        load: wgpu::LoadOp::Clear(clear_color(
+                            background,
+                            self.config.format.is_srgb(),
+                        )),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -852,7 +769,7 @@ impl Graphics {
             if !bytes.is_empty() {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_vertex_buffer(0, self.buffer.slice(..));
-                pass.draw(0..6, 0..self.instances.len() as u32);
+                pass.draw(0..6, 0..instances.len() as u32);
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -878,24 +795,54 @@ fn pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderP
             r#"
 struct Output {
     @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec4<f32>,
+    @location(1) @interpolate(flat) shape: vec4<f32>,
+    @location(2) local: vec2<f32>,
 }
+
+override target_srgb: bool = false;
 
 @vertex
 fn vertex_main(
     @builtin(vertex_index) index: u32,
     @location(0) rect: vec4<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) shape: vec4<f32>,
 ) -> Output {
     let corners = array<vec2<f32>, 6>(
         vec2<f32>(0., 0.), vec2<f32>(1., 0.), vec2<f32>(0., 1.),
         vec2<f32>(0., 1.), vec2<f32>(1., 0.), vec2<f32>(1., 1.),
     );
-    return Output(vec4<f32>(rect.xy + corners[index] * rect.zw, 0., 1.), color);
+    let uv = corners[index];
+    return Output(vec4<f32>(rect.xy + uv * rect.zw, 0., 1.), color, shape, (uv - 0.5) * shape.xy);
+}
+
+fn round_span(y: f32, half_size: vec2<f32>, radius: f32) -> f32 {
+    let corner = max(0., abs(y) - (half_size.y - radius));
+    return half_size.x - radius + sqrt(max(0., radius * radius - corner * corner));
 }
 
 @fragment
 fn fragment_main(input: Output) -> @location(0) vec4<f32> {
+    let half_size = input.shape.xy * 0.5;
+    let radius = input.shape.z;
+    let stroke = input.shape.w;
+    let x = abs(input.local.x);
+    let y = abs(input.local.y);
+    if stroke < 0. {
+        if x > half_size.x * (1. - y / half_size.y) { discard; }
+    } else {
+        if radius > 0. && x > round_span(y, half_size, radius) { discard; }
+        if stroke > 0. {
+            let inner = half_size - stroke;
+            if y < inner.y && x < round_span(y, inner, max(0., radius - stroke)) { discard; }
+        }
+    }
+    if target_srgb {
+        let s = input.color.rgb;
+        let linear = select(pow((s + 0.055) / 1.055, vec3(2.4)), s / 12.92, s <= vec3(0.04045));
+        return vec4(linear, input.color.a);
+    }
     return input.color;
 }
 "#
@@ -912,7 +859,7 @@ fn fragment_main(input: Output) -> @location(0) vec4<f32> {
             buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: size_of::<Instance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4],
             })],
         },
         primitive: Default::default(),
@@ -921,7 +868,10 @@ fn fragment_main(input: Output) -> @location(0) vec4<f32> {
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fragment_main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[("target_srgb", if format.is_srgb() { 1.0 } else { 0.0 })],
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: None,
@@ -937,37 +887,56 @@ fn fragment_main(input: Output) -> @location(0) vec4<f32> {
 mod tests {
     use super::*;
 
+    fn view(width: u32, height: u32) -> View {
+        View {
+            size: PhysicalSize::new(width, height),
+            dpi: 1.0,
+            bounds: [-10, -8, 12, 9],
+        }
+    }
+
     #[test]
     fn hit_tests_cross_zero_with_euclidean_blocks() {
-        let size = PhysicalSize::new(240, 240);
-        let mut camera = Camera::centered(size);
+        let view = view(240, 240);
+        let size = view.size;
+        let mut camera = Camera::centered(view);
+        camera.center[0].offset = 4.0;
+        camera.center[1].offset = 4.0;
         camera.scale = 10.0;
-        let west = camera.hit(size, [79.0, 81.0]).unwrap();
+        let west = camera.hit(size, [77.0, 81.0]).unwrap();
         assert_eq!((west.x, west.y, west.cell.index()), (-1, 0, 7));
-        let north = camera.hit(size, [81.0, 79.0]).unwrap();
+        let north = camera.hit(size, [81.0, 77.0]).unwrap();
         assert_eq!((north.x, north.y, north.cell.index()), (0, -1, 56));
         let origin = camera.hit(size, [80.0, 80.0]).unwrap();
         assert_eq!((origin.x, origin.y, origin.cell.index()), (0, 0, 0));
+        assert_eq!(camera.hit(size, [79.0, 81.0]), None);
     }
 
     #[test]
     fn wheel_zoom_holds_the_tile_under_the_mouse() {
-        let size = PhysicalSize::new(840, 640);
-        let mut camera = Camera::centered(size);
+        let view = view(840, 640);
+        let mut camera = Camera::centered(view);
         let point = [128.0, 256.0];
-        let hit = camera.hit(size, point);
-        assert!(camera.zoom(size, point, 3.0));
-        assert_eq!(camera.hit(size, point), hit);
-        assert!(camera.zoom(size, point, -6.0));
-        assert_eq!(camera.hit(size, point), hit);
+        let world = camera.world_at(view.size, point).unwrap();
+        assert!(camera.zoom_at(view, point, 1.4));
+        assert!(camera.zoom_at(view, point, 0.7));
+        for (before, after) in world
+            .into_iter()
+            .zip(camera.world_at(view.size, point).unwrap())
+        {
+            assert!(before.distance(after).abs() < 1e-10);
+        }
+        camera.zoom_at(view, point, 0.001);
+        assert_eq!(camera.center, view.extent_center());
+        assert_eq!(camera.scale, view.min_scale());
     }
 
     #[test]
-    fn zoom_limits_visible_work_and_hit_testing_avoids_integer_overflow() {
-        let size = PhysicalSize::new(u32::MAX, u32::MAX);
-        let mut camera = Camera::centered(size);
-        let point = [f64::from(size.width) / 2.0; 2];
-        assert!(camera.visible_offsets(0, f64::from(size.width)).count() <= 65);
+    fn hit_testing_avoids_integer_overflow() {
+        let view = view(840, 640);
+        let size = view.size;
+        let mut camera = Camera::centered(view);
+        let point = screen_center(size);
         camera.center[0].block = i64::MAX;
         assert_eq!(camera.hit(size, point).unwrap().x, i64::MAX);
         assert_eq!(
@@ -978,32 +947,23 @@ mod tests {
     }
 
     #[test]
-    fn scene_shows_a_flip_then_the_four_opened_neighbors() {
-        let size = PhysicalSize::new(640, 480);
-        let mut camera = Camera::centered(size);
-        camera.scale = 20.0;
-        let palette = Palette::new(wgpu::TextureFormat::Bgra8UnormSrgb);
-        let mut game = Game::new();
+    fn painter_rejects_invisible_geometry_and_respects_budget() {
         let mut instances = Vec::new();
-        let count_color = |instances: &[Instance], color| {
-            instances.iter().filter(|tile| tile.color == color).count()
+        let mut p = Painter {
+            output: &mut instances,
+            size: PhysicalSize::new(200, 200),
+            limit: 2,
         };
-
-        board_instances(&mut instances, &palette, size, camera, &game, None);
-        assert_eq!(count_color(&instances, palette.white), 64);
-        assert!(game.activate(0, 0, CellIndex::new(0).unwrap()));
-        board_instances(&mut instances, &palette, size, camera, &game, None);
-        assert_eq!(count_color(&instances, palette.white), 63);
-        assert_eq!(count_color(&instances, palette.ink), 1);
-
-        for i in 1..64 {
-            assert!(game.activate(0, 0, CellIndex::new(i).unwrap()));
+        let rgb = [100, 150, 200];
+        p.rect(-30.0, -30.0, 20.0, 20.0, rgb);
+        p.rect(f64::NAN, 5.0, 20.0, 20.0, rgb);
+        p.rounded(5.0, 5.0, 20.0, 10.0, 10.0, rgb);
+        p.outline(5.0, 5.0, 10.0, 10.0, 4.0, 2.0, rgb);
+        for _ in 0..4 {
+            p.rect(5.0, 5.0, 20.0, 20.0, rgb);
         }
-        board_instances(&mut instances, &palette, size, camera, &game, None);
-        assert_eq!(count_color(&instances, palette.white), 4 * 64);
-        assert_eq!(count_color(&instances, palette.finished), 1);
-        camera.scale = 4.0;
-        board_instances(&mut instances, &palette, size, camera, &game, None);
-        assert_eq!(instances.len(), 5 * 2);
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].shape, [20.0, 10.0, 5.0, 0.0]);
+        assert_eq!(instances[1].shape, [12.0, 12.0, 5.0, 2.0]);
     }
 }

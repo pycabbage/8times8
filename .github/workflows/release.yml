@@ -14,15 +14,26 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Cache Cargo
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('rust-toolchain.toml') }}-
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev gcc-mingw-w64-x86-64-win32
       - name: Check Rust
         run: |
           cargo fmt --check
           cargo clippy --locked --release --all-targets -- -D warnings
           cargo test --locked --release
-      - name: Install MinGW linker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64-win32
       - uses: goreleaser/goreleaser-action@v7.3.0
         with:
           version: v2.20.3
