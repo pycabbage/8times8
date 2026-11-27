@@ -1,0 +1,8 @@
+{
+  "name": "8times8",
+  "productName": "8 times 8",
+  "version": "0.1.0",
+  "description": "静かにタイルを裏返していくタイルゲーム",
+  "main": "electron-main.js",
+  "private": true
+}
