@@ -19,4 +19,4 @@ cargo test --locked --release
 
 ## リリース
 
-`v*` タグの push 時だけ、GitHub Actions で上記のチェックを実行し、GoReleaser で Linux x86-64 (GNU) 向けの headless CLI を `tar.gz` と SHA-256 チェックサム付きで GitHub Releases に公開します。
+`v*` タグの push 時だけ、GitHub Actions で上記のチェックを実行し、GoReleaser で headless CLI と SHA-256 チェックサムを GitHub Releases に公開します。v0.1.1 以降の配布対象は Linux x86-64 (GNU) の `tar.gz` と Windows x86-64 (GNU) の ZIP です。どちらもヘルプとバージョン表示のみで、GUI はなくプレイできません。

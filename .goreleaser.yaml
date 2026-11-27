@@ -6,9 +6,12 @@ builds:
     binary: eight-times-eight
     tool: cargo
     command: build
-    targets: [x86_64-unknown-linux-gnu]
+    targets: [x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu]
     flags: [--release, --locked]
 
 archives:
   - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
     files: [README.md]
